@@ -1,771 +1,1120 @@
 # src/llm_tasks.py
 
 """
-LLM-based tasks for PDD generation.
-Uses Ollama to extract information from transcripts.
-Optimized prompts for accurate business process extraction.
+LLM-based tasks for PDD/BRD generation.
+Universal prompts that work for ANY business process meeting.
+
+PROMPT DESIGN:
+1. System prompt establishes ROLE and THINKING MODE
+2. Each prompt uses ROLE → CONTEXT → TASK → FORMAT pattern
+3. All examples use generic placeholders [Application], [System], etc.
+4. No product names, technology names, or specific architectures in examples
+5. Technology-neutral: works for RPA, scripts, APIs, workflows, etc.
+
+ANTI-HALLUCINATION:
+- Every prompt reminds the LLM to use ONLY transcript content
+- Entity verification removes names not found in transcript
+- No product names in examples that could leak into output
+- Prompt sizes are kept within safe limits for the model
 """
 
 import re
-from typing import Optional, Dict, List, Tuple, Set
+import time
+from typing import Optional, Dict, List, Tuple
 from llm_client import llm_client
+from config import llm_params, doc_config, ACTION_KEYWORDS
 
 
-# Configuration
-CHUNK_SIZE = 4000
-OVERLAP_SIZE = 200
+MAX_SAMPLE = llm_params.max_sample_text
+MAX_SAMPLE_SMALL = llm_params.max_sample_small
+MAX_SAMPLE_ENTITY = llm_params.max_sample_entity
+CHUNK_SIZE = llm_params.chunk_size
+MAX_CHUNKS = llm_params.max_chunks
+OVERLAP_SIZE = llm_params.overlap_size
 
 
-def split_into_chunks(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = OVERLAP_SIZE) -> List[str]:
-    """Split text into overlapping chunks for processing."""
-    if len(text) <= chunk_size:
+# ============================================================
+# UNIVERSAL SYSTEM PROMPT
+# Technology-neutral, anti-hallucination
+# ============================================================
+
+SYSTEM_PROMPT = """You are a senior Business Analyst who creates Process Definition Documents and Business Requirement Documents for automation projects.
+
+You receive transcripts of meetings where business teams discuss a process they want to automate. Your job is to understand the UNDERLYING BUSINESS PROCESS and document it professionally.
+
+RULES:
+
+1. SEPARATE CONVERSATION FROM PROCESS
+   Extract only PROCESS ACTIONS. Ignore conversation, greetings, scheduling, and small talk.
+
+2. TRANSLATE HUMAN ACTIONS TO SYSTEM ACTIONS
+   Convert manual human descriptions into professional automation language.
+   Human says: "I open the file and check each row"
+   You write: "The system opens the source data file and iterates through each record for validation."
+
+3. RECONSTRUCT THE LOGICAL SEQUENCE
+   Meetings are messy. Reconstruct the complete end-to-end process in logical order.
+
+4. USE PROFESSIONAL LANGUAGE
+   Third person. Automation terminology. No first person.
+   "The system establishes a connection..."
+   "Validates each record against..."
+   "Updates the execution status..."
+
+5. ANTI-HALLUCINATION — MANDATORY:
+   - Use ONLY names, applications, and systems EXPLICITLY mentioned in the provided text
+   - NEVER invent or substitute names from your training data
+   - If a name is unclear, use generic terms: "the application", "the portal", "the system"
+   - NEVER mention the meeting, transcript, or recording
+   - NEVER write "they discussed" or "the team agreed"
+   - NEVER use first person"""
+
+
+# ============================================================
+# UTILITY FUNCTIONS
+# ============================================================
+
+def _timed(name: str, start: float):
+    """Log elapsed time for a task."""
+    print(f"    [{name}] done in {time.time() - start:.1f}s")
+
+
+def _safe_sample(transcript: str, max_len: int = None) -> str:
+    """Take a safe-sized sample. Beginning + End."""
+    max_len = max_len or MAX_SAMPLE
+    if len(transcript) <= max_len:
+        return transcript
+    first = int(max_len * 0.6)
+    last = max_len - first - 30
+    return transcript[:first] + "\n[...]\n" + transcript[-last:]
+
+
+def split_into_chunks(text: str) -> List[str]:
+    """Split text into overlapping chunks."""
+    if len(text) <= CHUNK_SIZE:
         return [text]
-    
     chunks = []
     start = 0
-    
-    while start < len(text):
-        end = start + chunk_size
-        
+    while start < len(text) and len(chunks) < MAX_CHUNKS:
+        end = min(start + CHUNK_SIZE, len(text))
         if end < len(text):
-            break_point = text.rfind('. ', start + chunk_size - 200, end)
-            if break_point != -1:
-                end = break_point + 1
-        
+            bp = text.rfind('. ', start + CHUNK_SIZE - 300, end)
+            if bp != -1:
+                end = bp + 1
         chunks.append(text[start:end].strip())
-        start = end - overlap
-        
-        if start < 0:
-            start = 0
-    
+        start = end - OVERLAP_SIZE
+        if start <= 0 and chunks:
+            break
     return chunks
 
 
-def extract_entities(transcript: str) -> Dict[str, List[str]]:
+def _build_entity_hint(entities: Dict) -> str:
+    """Build a hint string from extracted entities."""
+    parts = []
+    if entities.get("companies"):
+        parts.append(f"Companies: {', '.join(entities['companies'])}")
+    if entities.get("applications"):
+        parts.append(f"Applications: {', '.join(entities['applications'])}")
+    if entities.get("systems"):
+        parts.append(f"Systems: {', '.join(entities['systems'])}")
+    if parts:
+        return "Entities from transcript: " + "; ".join(parts)
+    return ""
+
+
+def _verify_entities_against_transcript(entities: Dict, transcript: str) -> Dict:
     """
-    Extract key entities (companies, applications, systems) from transcript.
-    Helps correct Whisper transcription errors.
-    
-    Args:
-        transcript: The meeting transcript.
-        
-    Returns:
-        Dictionary of entity types and their values.
+    Remove entity names that don't appear in the transcript.
+    Catches LLM hallucinations.
     """
-    # Use first and last portions where entities are often mentioned
-    sample = transcript[:3000]
-    if len(transcript) > 4000:
-        sample += "\n...\n" + transcript[-1500:]
-    
-    prompt = f"""Extract the following entities from this meeting transcript.
+    transcript_lower = transcript.lower()
 
-IMPORTANT: 
-- Fix any obvious spelling/transcription errors (e.g., "Eventy" should be "Ivanti", "Micro Soft" should be "Microsoft")
-- Use correct capitalization for company and product names
-- Only include entities that are actually mentioned
+    def _appears(name: str) -> bool:
+        name_lower = name.lower().strip()
+        if name_lower in transcript_lower:
+            return True
+        # Multi-word: all significant words must appear
+        words = name_lower.split()
+        if len(words) > 1:
+            significant = [w for w in words if len(w) > 3]
+            if significant and all(w in transcript_lower for w in significant):
+                return True
+        # Prefix match (4+ chars)
+        if len(name_lower) >= 4 and name_lower[:4] in transcript_lower:
+            return True
+        # No-space match
+        no_space = name_lower.replace(" ", "")
+        if len(no_space) >= 4 and no_space in transcript_lower.replace(" ", ""):
+            return True
+        return False
 
-Return in this exact format:
-COMPANY: [company name 1], [company name 2]
-APPLICATIONS: [app 1], [app 2], [app 3]
-SYSTEMS: [system 1], [system 2]
-DEPARTMENTS: [dept 1], [dept 2]
-PROCESSES: [process name 1], [process name 2]
+    verified = {}
+    for key, items in entities.items():
+        if isinstance(items, list):
+            verified_items = []
+            for item in items:
+                if _appears(item):
+                    verified_items.append(item)
+                else:
+                    print(f"    [Entities] ⚠ Removed hallucinated: '{item}'")
+            verified[key] = verified_items
+        else:
+            verified[key] = items
+    return verified
 
-Transcript:
-{sample}
 
-Entities:"""
+# ============================================================
+# CALL 1: Entities + Project Name
+# ============================================================
 
-    response = llm_client.generate_with_stream(prompt)
-    
+def extract_entities_and_project(transcript: str) -> Tuple[Dict[str, List[str]], str]:
+    """Extract named entities and project name from transcript."""
+    start = time.time()
+    sample = _safe_sample(transcript, max_len=MAX_SAMPLE_ENTITY)
+
+    prompt = f"""Extract factual information from this meeting transcript.
+
+RULES:
+- ONLY extract names EXPLICITLY mentioned in the text
+- Do NOT guess or correct names — write them exactly as they appear
+- If no names are mentioned for a category, write "None"
+- For the project name: if not stated, create a short descriptive name from the main process discussed
+
+OUTPUT FORMAT:
+COMPANIES: name1, name2
+APPLICATIONS: name1, name2
+SYSTEMS: name1, name2
+DEPARTMENTS: name1, name2
+PROJECT_NAME: Short Descriptive Name
+
+TRANSCRIPT:
+{sample}"""
+
+    response = llm_client.generate(prompt, system_prompt=SYSTEM_PROMPT)
+
     entities = {
-        "companies": [],
-        "applications": [],
-        "systems": [],
-        "departments": [],
-        "processes": []
+        "companies": [], "applications": [], "systems": [],
+        "departments": [], "processes": []
     }
-    
+    project_name = "Process Automation Project"
+
     if response:
         for line in response.split('\n'):
             line = line.strip()
-            if line.startswith('COMPANY:'):
-                entities["companies"] = [x.strip() for x in line[8:].split(',') if x.strip()]
-            elif line.startswith('APPLICATIONS:'):
-                entities["applications"] = [x.strip() for x in line[13:].split(',') if x.strip()]
-            elif line.startswith('SYSTEMS:'):
-                entities["systems"] = [x.strip() for x in line[8:].split(',') if x.strip()]
-            elif line.startswith('DEPARTMENTS:'):
-                entities["departments"] = [x.strip() for x in line[12:].split(',') if x.strip()]
-            elif line.startswith('PROCESSES:'):
-                entities["processes"] = [x.strip() for x in line[10:].split(',') if x.strip()]
-    
-    return entities
+            if ':' not in line:
+                continue
+            key, _, value = line.partition(':')
+            key = key.strip().upper()
+            items = [
+                x.strip() for x in value.split(',')
+                if x.strip() and x.strip().lower() not in
+                ['none', 'n/a', '', 'not mentioned', 'none mentioned']
+            ]
+            if 'COMPAN' in key:
+                entities["companies"] = items
+            elif 'APPLIC' in key:
+                entities["applications"] = items
+            elif 'SYSTEM' in key:
+                entities["systems"] = items
+            elif 'DEPART' in key:
+                entities["departments"] = items
+            elif 'PROJECT' in key:
+                name = value.strip().strip('"\'')
+                if name and name.lower() not in ['none', 'n/a', 'not mentioned']:
+                    project_name = ' '.join(name.split()[:7])
+
+    entities = _verify_entities_against_transcript(entities, transcript)
+    _timed("Entities+Project", start)
+    return entities, project_name
 
 
-def get_project_name(transcript: str) -> str:
-    """
-    Extract or generate accurate project name from transcript.
-    
-    Args:
-        transcript: The meeting transcript text.
-        
-    Returns:
-        Project name.
-    """
-    # Extract entities first to get correct spellings
-    entities = extract_entities(transcript)
-    
-    # Build context from entities
-    context = ""
-    if entities["companies"]:
-        context += f"Companies mentioned: {', '.join(entities['companies'])}\n"
-    if entities["processes"]:
-        context += f"Processes discussed: {', '.join(entities['processes'])}\n"
-    if entities["applications"]:
-        context += f"Applications used: {', '.join(entities['applications'])}\n"
-    
-    sample = transcript[:2500]
-    if len(transcript) > 3500:
-        sample += "\n...\n" + transcript[-1000:]
-    
-    prompt = f"""Identify the main project or process name from this meeting transcript.
+# ============================================================
+# CALL 2: Document Purpose
+# ============================================================
 
-Known Entities (use correct spellings from here):
-{context}
+def get_document_purpose_text(transcript: str, project_name: str, entity_hint: str) -> str:
+    """Generate the Purpose of this Document section."""
+    start = time.time()
+    sample = _safe_sample(transcript, max_len=MAX_SAMPLE_SMALL)
 
-Instructions:
-- Use the EXACT correct spelling of company/product names from the entities above
-- If a specific project name is mentioned, use it exactly
-- If no project name is mentioned, create a descriptive name like "[Company] [Process] Automation"
-- Return ONLY the project name (3-7 words)
-- No explanations, quotes, or extra text
+    prompt = f"""Write the "Purpose of this Document" section for a {doc_config.document_type_full}.
 
-Transcript:
+Project: "{project_name}". {entity_hint}
+
+Write 1-2 paragraphs covering:
+- What this document defines (objectives, scope, requirements)
+- What process is being documented for automation
+- That it covers current manual state and future automated state
+- That it serves as the basis for designing and deploying the solution
+
+Use ONLY names from the transcript. Formal business English. Third person.
+
+TRANSCRIPT:
 {sample}
 
-Project Name:"""
+PURPOSE:"""
 
-    response = llm_client.generate_with_stream(prompt)
-    
-    if response:
-        name = response.strip().split('\n')[0].strip()
-        name = name.strip('"\'').strip()
-        words = name.split()[:7]
-        return ' '.join(words) if words else "Process Automation Project"
-    
-    return "Process Automation Project"
+    response = llm_client.generate(prompt, system_prompt=SYSTEM_PROMPT)
+    _timed("Purpose", start)
 
-
-def get_document_purpose(transcript: str, project_name: str) -> str:
-    """
-    Generate a specific document purpose based on the actual process.
-    
-    Args:
-        transcript: The meeting transcript.
-        project_name: The project name.
-        
-    Returns:
-        Document purpose text.
-    """
-    sample = transcript[:4000]
-    
-    prompt = f"""Based on this meeting transcript for "{project_name}", write a specific Document Purpose section.
-
-The Document Purpose should explain:
-1. What specific process is being documented
-2. Why this process is being automated
-3. What business problem it solves
-4. Who will use this document
-
-Write 2-3 paragraphs in professional language.
-Do NOT use generic placeholder text.
-Be specific to this actual process.
-
-Transcript:
-{sample}
-
-Document Purpose:"""
-
-    response = llm_client.generate_with_stream(prompt)
-    
-    if response and len(response) > 100:
+    if response and len(response) > 50:
         return response.strip()
-    
-    # Fallback to generic but include project name
-    return f"""The purpose of this Process Definition Document (PDD) is to capture the business-related details of the {project_name} process being automated. It describes how the automated solution will operate and serves as a key input for the technical design.
 
-This document ensures that:
-• Process requirements for {project_name} are captured in line with organizational standards
-• It provides detailed information on the process flow and step-by-step procedures
-• Stakeholders have a clear understanding of the expected results and automation objectives
-• The development team has accurate specifications for building the solution"""
+    return (
+        f"This {doc_config.document_type_full} ({doc_config.document_type}) defines the "
+        f"objectives, scope, and detailed business requirements for the {project_name} "
+        f"initiative. It describes the current manual process and the future automated "
+        f"state required to design, develop, and deploy the automation solution."
+    )
 
 
-def get_process_summary(transcript: str, entities: Dict = None) -> str:
-    """
-    Generate accurate business process summary from transcript.
-    
-    Args:
-        transcript: The meeting transcript text.
-        entities: Pre-extracted entities for context.
-        
-    Returns:
-        Process summary text.
-    """
-    if entities is None:
-        entities = extract_entities(transcript)
-    
-    # Build entity context
-    entity_context = "Use these correct entity names:\n"
-    if entities["companies"]:
-        entity_context += f"- Companies: {', '.join(entities['companies'])}\n"
-    if entities["applications"]:
-        entity_context += f"- Applications: {', '.join(entities['applications'])}\n"
-    if entities["systems"]:
-        entity_context += f"- Systems: {', '.join(entities['systems'])}\n"
-    
-    chunks = split_into_chunks(transcript, chunk_size=5000)
-    
-    if len(chunks) == 1:
-        return _summarize_single(chunks[0], entity_context)
-    
-    print(f"    [Chunking] Processing {len(chunks)} chunks for summary...")
-    
-    # Step 1: Extract key points from each chunk
-    chunk_summaries = []
-    for i, chunk in enumerate(chunks):
-        print(f"    [Chunk {i+1}/{len(chunks)}] Analyzing...")
-        
-        prompt = f"""Extract the key business process information from this transcript section.
+# ============================================================
+# CALL 3: Overview & Objective + Business Justification
+# ============================================================
 
-{entity_context}
+def get_overview_and_justification(
+    transcript: str, project_name: str, entity_hint: str
+) -> Dict[str, str]:
+    """Generate Overview/Objective and Business Justification."""
+    start = time.time()
+    sample = _safe_sample(transcript, max_len=MAX_SAMPLE)
 
-Focus on:
-1. What actions are being performed
-2. Which applications/systems are used
-3. What data is being processed
-4. What decisions or validations occur
-5. What is the expected outcome
+    prompt = f"""Write two sections for a {doc_config.document_type_full}.
 
-Be specific and use correct entity names. List as bullet points.
+Project: "{project_name}". {entity_hint}
 
-Transcript Section {i+1}:
-{chunk}
+Use ONLY names from the transcript.
 
-Key Process Points:"""
+===OVERVIEW===
+Write an "Overview and Objective" section:
+- One paragraph stating the primary objective
+- Then 4-6 bullet points of what the automation achieves
+- Use action phrases: "Ensure...", "Standardize...", "Reduce...", "Improve..."
 
-        summary = llm_client.generate_with_stream(prompt)
-        if summary:
-            chunk_summaries.append(summary)
-    
-    if not chunk_summaries:
-        return "Unable to generate process summary."
-    
-    combined = "\n\n".join(chunk_summaries)
-    
-    print(f"    [Final] Creating cohesive summary...")
-    
-    final_prompt = f"""Create a professional business process summary from these extracted points.
+===JUSTIFICATION===
+Write a "Business Justification" section:
+- Opening sentence about operational benefits
+- Then 4-6 numbered items with **bold title** and description
 
-{entity_context}
+TRANSCRIPT:
+{sample}"""
 
-Instructions:
-- Write 3-4 paragraphs describing the complete process
-- Start with the process objective/purpose
-- Describe the main steps in logical order
-- Mention the applications and systems used
-- End with the expected outcome
-- Use professional business language
-- NO bullet points, write flowing paragraphs
-- Use CORRECT spellings of all company/product names
+    response = llm_client.generate(prompt, system_prompt=SYSTEM_PROMPT)
+    _timed("Overview+Justification", start)
 
-Extracted Points:
-{combined}
+    result = {"overview": "", "justification": ""}
+    if response:
+        ov = re.search(
+            r'===OVERVIEW===\s*(.*?)(?====JUSTIFICATION===|$)',
+            response, re.DOTALL
+        )
+        jf = re.search(r'===JUSTIFICATION===\s*(.*?)$', response, re.DOTALL)
+        if ov:
+            result["overview"] = ov.group(1).strip()
+        if jf:
+            result["justification"] = jf.group(1).strip()
 
-Process Summary:"""
-
-    final_summary = llm_client.generate_with_stream(final_prompt)
-    return final_summary if final_summary else combined
-
-
-def _summarize_single(transcript: str, entity_context: str) -> str:
-    """Summarize a short transcript."""
-    prompt = f"""Write a professional business process summary from this meeting transcript.
-
-{entity_context}
-
-Instructions:
-- Write 3-4 paragraphs describing the complete process
-- Start with the process objective/purpose  
-- Describe the main steps in logical order
-- Mention the applications and systems used
-- End with the expected outcome
-- Use professional business language
-- NO bullet points
-
-Transcript:
-{transcript}
-
-Process Summary:"""
-
-    response = llm_client.generate_with_stream(prompt)
-    return response if response else "Unable to generate process summary."
-
-
-def get_inputs_outputs(transcript: str, entities: Dict = None) -> str:
-    """
-    Extract detailed process inputs and outputs.
-    
-    Args:
-        transcript: The meeting transcript text.
-        entities: Pre-extracted entities.
-        
-    Returns:
-        Formatted inputs and outputs text.
-    """
-    if entities is None:
-        entities = extract_entities(transcript)
-    
-    entity_context = ""
-    if entities["applications"]:
-        entity_context = f"Applications in use: {', '.join(entities['applications'])}\n"
-    
-    chunks = split_into_chunks(transcript, chunk_size=5000)
-    
-    all_inputs = set()
-    all_outputs = set()
-    
-    print(f"    [Chunking] Processing {len(chunks)} chunks for I/O...")
-    
-    for i, chunk in enumerate(chunks):
-        print(f"    [Chunk {i+1}/{len(chunks)}] Extracting I/O...")
-        
-        prompt = f"""Analyze this transcript section and identify process INPUTS and OUTPUTS.
-
-{entity_context}
-
-INPUTS are:
-- Files or documents received/uploaded (e.g., "Excel spreadsheet with employee data")
-- Data entered by users (e.g., "Employee ID", "Date range")
-- Information retrieved from systems (e.g., "Customer records from CRM")
-- Credentials or access requirements
-- Trigger events that start the process
-
-OUTPUTS are:
-- Files or reports generated (e.g., "PDF invoice", "Excel report")
-- Data saved to systems (e.g., "Updated customer record in database")
-- Emails or notifications sent
-- Status updates or confirmations
-- Decisions or approvals recorded
-
-Format each item as:
-INPUT: [specific description]
-OUTPUT: [specific description]
-
-Be SPECIFIC - include file types, field names, system names where mentioned.
-
-Transcript Section:
-{chunk}
-
-Inputs and Outputs:"""
-
-        response = llm_client.generate_with_stream(prompt)
-        
-        if response:
-            for line in response.split('\n'):
-                line = line.strip()
-                if line.upper().startswith('INPUT:'):
-                    item = line[6:].strip().strip('-•*').strip()
-                    if item and len(item) > 3:
-                        all_inputs.add(item)
-                elif line.upper().startswith('OUTPUT:'):
-                    item = line[7:].strip().strip('-•*').strip()
-                    if item and len(item) > 3:
-                        all_outputs.add(item)
-    
-    # Format nicely
-    result = "**Inputs:**\n"
-    if all_inputs:
-        for inp in sorted(all_inputs):
-            result += f"  ➤ {inp}\n"
-    else:
-        result += "  ➤ No specific inputs identified\n"
-    
-    result += "\n**Outputs:**\n"
-    if all_outputs:
-        for out in sorted(all_outputs):
-            result += f"  ➤ {out}\n"
-    else:
-        result += "  ➤ No specific outputs identified\n"
-    
+    if not result["overview"]:
+        result["overview"] = (
+            f"The primary objective is to automate the {project_name} process "
+            f"to ensure consistency, accuracy, and compliance."
+        )
+    if not result["justification"]:
+        result["justification"] = (
+            f"The {project_name} delivers operational efficiency "
+            f"and governance control."
+        )
     return result
 
 
-def generate_dot_code(transcript: str, entities: Dict = None) -> Optional[str]:
-    """
-    Generate accurate Graphviz DOT code for process flowchart.
-    
-    Args:
-        transcript: The meeting transcript text.
-        entities: Pre-extracted entities.
-        
-    Returns:
-        DOT code string or None if failed.
-    """
-    if entities is None:
-        entities = extract_entities(transcript)
-    
-    entity_context = ""
-    if entities["applications"]:
-        entity_context = f"Applications used: {', '.join(entities['applications'])}\n"
-    
-    chunks = split_into_chunks(transcript, chunk_size=4000)
-    
-    print(f"    [Chunking] Processing {len(chunks)} chunks for flowchart...")
-    
-    # Step 1: Extract ordered process steps from each chunk
-    all_steps = []
-    
-    for i, chunk in enumerate(chunks):
-        print(f"    [Chunk {i+1}/{len(chunks)}] Extracting steps...")
-        
-        prompt = f"""Extract the PROCESS STEPS from this transcript section.
+# ============================================================
+# CALL 4: "As Is" Process
+# ============================================================
 
-{entity_context}
+def get_as_is_process(
+    transcript: str, project_name: str, entity_hint: str
+) -> str:
+    """Generate the current manual process (As Is state)."""
+    start = time.time()
+    sample = _safe_sample(transcript, max_len=MAX_SAMPLE)
 
-Rules:
-- Each step should be a clear action (verb + object)
-- Include the application/system name if mentioned
-- Keep steps concise (5-10 words each)
-- Mark decision points with [DECISION] prefix
-- Number each step in order
+    prompt = f"""Document the CURRENT MANUAL PROCESS ("As Is" state).
 
-Examples of good steps:
-1. Open Ivanti Service Management portal
-2. Search for ticket using ticket number
-3. [DECISION] Check if ticket status is Open
-4. Update ticket status to In Progress
-5. Add resolution notes to ticket
+Project: "{project_name}". {entity_hint}
 
-Transcript Section {i+1}:
-{chunk}
+Use ONLY names from the transcript.
 
-Process Steps:"""
+Write 4-8 numbered steps. Each step:
+- **Bold title**
+- Description: what the person manually does
+- Tools Used: applications used (ONLY from transcript)
 
-        response = llm_client.generate_with_stream(prompt)
-        
-        if response:
-            for line in response.split('\n'):
-                line = line.strip()
-                step = re.sub(r'^[\d]+[\.\)]\s*', '', line).strip()
-                if step and len(step) > 5:
-                    all_steps.append(step)
-    
-    if not all_steps:
-        print("    [Warning] No steps extracted")
-        return None
-    
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_steps = []
-    for step in all_steps:
-        step_key = re.sub(r'[^a-zA-Z]', '', step.lower())
-        if step_key not in seen and len(step_key) > 3:
-            seen.add(step_key)
-            unique_steps.append(step)
-    
-    # Limit to reasonable number
-    if len(unique_steps) > 12:
-        # Keep important steps: first 5, last 5, and 2 from middle
-        middle_start = len(unique_steps) // 2 - 1
-        unique_steps = unique_steps[:5] + unique_steps[middle_start:middle_start+2] + unique_steps[-5:]
-    
-    print(f"    [Final] Generating flowchart with {len(unique_steps)} steps...")
-    
-    # Step 2: Generate proper DOT code
-    steps_text = "\n".join([f"{i+1}. {step}" for i, step in enumerate(unique_steps)])
-    
-    prompt = f"""Generate a Graphviz DOT flowchart from these process steps.
+Then add "Business Challenges" with 4-6 bullet points.
 
-Process Steps:
-{steps_text}
-
-Requirements:
-1. Start with a "Start" node (shape=oval, color=lightgreen)
-2. End with an "End" node (shape=oval, color=lightcoral)
-3. Regular steps use shape=box, color=lightblue
-4. Steps marked [DECISION] use shape=diamond, color=gold
-5. Decision nodes must have exactly 2 outgoing edges labeled "Yes" and "No"
-6. All nodes must be connected - no orphan nodes
-7. Use descriptive but concise labels (wrap long text with \\n)
-8. Node IDs should be simple: Start, Step1, Step2, Decision1, End
-
-Generate ONLY valid DOT code, no explanation:
-
-digraph ProcessFlow {{
-    // Graph settings
-    rankdir=TB;
-    node [fontname="Arial", fontsize=10];
-    edge [fontname="Arial", fontsize=9];
-    
-    // Nodes
-    ...
-    
-    // Edges
-    ...
-}}"""
-
-    response = llm_client.generate_with_stream(prompt)
-    
-    if not response:
-        return None
-    
-    # Extract DOT code
-    match = re.search(r'```(?:dot|graphviz)?\n?(.*?)```', response, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    
-    match = re.search(r'digraph\s+\w*\s*\{.*\}', response, re.DOTALL)
-    if match:
-        return match.group(0).strip()
-    
-    if 'digraph' in response:
-        return response.strip()
-    
-    return None
-
-
-def get_applications_table(transcript: str, entities: Dict = None) -> List[Dict]:
-    """
-    Extract applications/systems table data.
-    
-    Args:
-        transcript: The meeting transcript.
-        entities: Pre-extracted entities.
-        
-    Returns:
-        List of application dictionaries.
-    """
-    if entities is None:
-        entities = extract_entities(transcript)
-    
-    sample = transcript[:6000]
-    
-    apps_hint = ""
-    if entities["applications"]:
-        apps_hint = f"Known applications: {', '.join(entities['applications'])}\n"
-    
-    prompt = f"""From this transcript, extract information about each application/system used in the process.
-
-{apps_hint}
-
-For each application, provide:
-- Application: Full correct name
-- Interface: How it's accessed (Web Browser, Desktop App, API, etc.)
-- Key Operation: Main URL or primary action performed
-- Purpose: Brief description of its role in the process
-
-Format as:
-APP: [name] | INTERFACE: [type] | URL: [url or action] | PURPOSE: [description]
-
-Transcript:
+TRANSCRIPT:
 {sample}
 
-Applications:"""
+CURRENT MANUAL PROCESS:"""
 
-    response = llm_client.generate_with_stream(prompt)
-    
-    applications = []
-    
+    response = llm_client.generate(prompt, system_prompt=SYSTEM_PROMPT)
+    _timed("As-Is", start)
+
+    if response and len(response) > 100:
+        return response.strip()
+    return (
+        f"The current {project_name} process is performed manually. "
+        f"Details to be documented during implementation."
+    )
+
+
+# ============================================================
+# CALL 5: "To Be" Process
+# ============================================================
+
+def get_to_be_process(
+    transcript: str, project_name: str, entity_hint: str
+) -> str:
+    """Generate the future automated process (To Be state)."""
+    start = time.time()
+    sample = _safe_sample(transcript, max_len=MAX_SAMPLE)
+
+    prompt = f"""Write the "To Be" automated process description.
+
+Project: "{project_name}". {entity_hint}
+
+Use ONLY names from the transcript.
+
+Write 2-3 paragraphs describing how the automation handles this process end-to-end:
+- Write as if the automation already exists
+- Use: "The system will...", "The automation will automatically..."
+- Cover: trigger → connection → data handling → processing → validation → action → reporting → logging
+- End with audit readiness and compliance
+
+TRANSCRIPT:
+{sample}
+
+TO-BE PROCESS:"""
+
+    response = llm_client.generate(prompt, system_prompt=SYSTEM_PROMPT)
+    _timed("To-Be", start)
+
+    if response and len(response) > 100:
+        return response.strip()
+    return (
+        f"The {project_name} will use an automation solution to "
+        f"handle the end-to-end process."
+    )
+
+
+# ============================================================
+# CALL 6: Process Steps (Technology-Neutral)
+# ============================================================
+
+def extract_process_steps(transcript: str, entities: Dict = None) -> List[str]:
+    """
+    Extract automation process steps.
+    Technology-neutral — works for any automation type.
+    Uses 3 strategies with increasingly simple prompts.
+    """
+    start = time.time()
+
+    if entities is None:
+        entities, _ = extract_entities_and_project(transcript)
+
+    entity_hint = _build_entity_hint(entities)
+    all_steps = []
+
+    # Strategy 1: Full extraction
+    print("    [Steps] Strategy 1: Full extraction...")
+    sample = _safe_sample(transcript, max_len=MAX_SAMPLE)
+
+    prompt = f"""Extract the automation process steps from this meeting transcript.
+
+{entity_hint}
+
+Use ONLY names from the transcript.
+
+Write 8-15 numbered steps describing what the AUTOMATED SYSTEM does.
+
+CRITICAL: Extract PROCESS ACTIONS, not meeting conversation.
+
+WRONG (meeting summaries):
+- "Team discussed downloading data"
+- "Agreed to validate records"
+
+CORRECT (system actions):
+- "Connects to [Application] using authorized credentials."
+- "Extracts relevant data from the source system."
+- "Filters records based on defined business rules."
+- "Validates each record against the defined criteria."
+- "Performs the required action for eligible records."
+- "Generates a report containing processed records and outcomes."
+- "Updates the execution status based on results."
+- "Logs execution details for audit and tracking."
+
+Each step should:
+- Start with a verb: Connects, Extracts, Validates, Navigates, Generates, Updates, Logs
+- Describe a SYSTEM action
+- Be 1-2 sentences
+
+TRANSCRIPT:
+{sample}
+
+PROCESS STEPS:
+1."""
+
+    response = llm_client.generate(prompt, system_prompt=SYSTEM_PROMPT)
+
+    if response:
+        if not response.strip().startswith("1"):
+            response = "1. " + response
+        all_steps = _parse_numbered_steps(response)
+        print(f"    [Steps] Strategy 1: {len(all_steps)} steps")
+
+    # Strategy 2: Simplified
+    if len(all_steps) < 3:
+        print("    [Steps] Strategy 2: Simplified...")
+        prompt = f"""What steps will an automated system perform for this process?
+
+{entity_hint}
+
+Use ONLY names from the transcript.
+Write 8-12 steps. Start each with a verb.
+
+{_safe_sample(transcript, MAX_SAMPLE_SMALL)}
+
+Steps:
+1."""
+        response = llm_client.generate(prompt, system_prompt=SYSTEM_PROMPT)
+        if response:
+            if not response.strip().startswith("1"):
+                response = "1. " + response
+            s2 = _parse_numbered_steps(response)
+            if len(s2) > len(all_steps):
+                all_steps = s2
+            print(f"    [Steps] Strategy 2: {len(s2)} steps")
+
+    # Strategy 3: Template fallback
+    if len(all_steps) < 3:
+        print("    [Steps] Strategy 3: Template...")
+        all_steps = _template_steps(entities)
+
+    unique = _deduplicate_steps(all_steps)
+    if len(unique) > 20:
+        mid = len(unique) // 2
+        unique = unique[:8] + unique[mid-2:mid+2] + unique[-8:]
+    if not unique:
+        unique = _template_steps(entities)
+
+    _timed(f"Steps ({len(unique)})", start)
+    return unique
+
+
+def _template_steps(entities: Dict) -> List[str]:
+    """Generate template steps when LLM extraction fails. Technology-neutral."""
+    apps = ', '.join(entities.get('applications', [])) or 'the target application'
+    return [
+        f"Connects to {apps} using authorized credentials.",
+        f"Extracts relevant data from {apps}.",
+        "Filters and processes records based on defined business rules.",
+        "Validates each record against the defined criteria.",
+        f"Performs the required actions for eligible records in {apps}.",
+        "Captures updated status after processing each record.",
+        "Generates a report containing processed records and outcomes.",
+        "Updates the execution status based on results.",
+        "Logs execution details for audit and tracking.",
+    ]
+
+
+def _parse_numbered_steps(text: str) -> List[str]:
+    """Parse numbered steps from LLM response."""
+    steps = []
+    for line in text.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        cleaned = re.sub(r'^[\d]+[\.\)]\s*', '', line).strip()
+        cleaned = re.sub(r'^[-•*➤]\s*', '', cleaned).strip()
+        cleaned = cleaned.strip('"')
+        if not cleaned or len(cleaned) < 10:
+            continue
+        skip = [
+            'here are', 'following', 'process steps', 'transcript',
+            'note:', 'section', 'based on', 'the above', 'these are',
+            'below', 'i have', 'let me', 'sure,', 'certainly',
+            'wrong', 'correct', 'critical', 'example', '❌', '✅',
+            'important', 'context', 'the meeting', 'discussed',
+            'use only', 'names from'
+        ]
+        if any(cleaned.lower().startswith(p) for p in skip):
+            continue
+        if cleaned.startswith('WRONG') or cleaned.startswith('RIGHT'):
+            continue
+        if cleaned.isupper() or cleaned.endswith(':'):
+            continue
+        steps.append(cleaned)
+    return steps
+
+
+def _deduplicate_steps(steps: List[str]) -> List[str]:
+    """Remove near-duplicate steps."""
+    seen = set()
+    unique = []
+    for s in steps:
+        key = re.sub(r'[^a-z]', '', s.lower())[:40]
+        if key not in seen and len(key) > 5:
+            seen.add(key)
+            unique.append(s)
+    return unique
+
+
+# ============================================================
+# CALL 7: Input Requirements
+# ============================================================
+
+def get_input_requirements(
+    transcript: str, project_name: str, entity_hint: str
+) -> List[Dict]:
+    """Extract input requirements for the automation."""
+    start = time.time()
+    sample = _safe_sample(transcript, max_len=MAX_SAMPLE_SMALL)
+
+    prompt = f"""Identify input requirements for this automation project.
+
+Project: "{project_name}". {entity_hint}
+
+Use ONLY names from the transcript.
+
+List 3-8 inputs the automation needs. Consider:
+- Credentials/access for applications
+- Source data (files, databases, portals)
+- Configuration parameters
+- Identifiers for lookups
+
+FORMAT (one per line):
+INPUT: Parameter Name | DESCRIPTION: What it is and why needed
+
+TRANSCRIPT:
+{sample}
+
+INPUTS:"""
+
+    response = llm_client.generate(prompt, system_prompt=SYSTEM_PROMPT)
+    _timed("Inputs", start)
+
+    inputs = []
     if response:
         for line in response.split('\n'):
             line = line.strip()
-            if line.startswith('APP:'):
+            if '|' in line and 'INPUT' in line.upper():
                 parts = line.split('|')
-                app = {
-                    "application": "",
-                    "interface": "",
-                    "url": "",
-                    "purpose": ""
-                }
+                param, desc = "", ""
                 for part in parts:
                     part = part.strip()
-                    if part.startswith('APP:'):
-                        app["application"] = part[4:].strip()
-                    elif part.startswith('INTERFACE:'):
-                        app["interface"] = part[10:].strip()
-                    elif part.startswith('URL:'):
-                        app["url"] = part[4:].strip()
-                    elif part.startswith('PURPOSE:'):
-                        app["purpose"] = part[8:].strip()
-                
+                    if part.upper().startswith('INPUT'):
+                        param = re.sub(
+                            r'^INPUT[S]?\s*[:]\s*', '', part,
+                            flags=re.IGNORECASE
+                        ).strip()
+                    elif part.upper().startswith('DESC'):
+                        desc = re.sub(
+                            r'^DESCRIPTION\s*[:]\s*', '', part,
+                            flags=re.IGNORECASE
+                        ).strip()
+                if param:
+                    inputs.append({
+                        "parameter": param,
+                        "description": desc or "Required for execution."
+                    })
+
+    if not inputs:
+        inputs = [
+            {"parameter": "Application Credentials",
+             "description": "Authorized credentials for secure access."},
+            {"parameter": "Source Data",
+             "description": "Data from source applications."},
+            {"parameter": "Automation Configuration",
+             "description": "Configured workflow for execution."},
+        ]
+    return inputs
+
+
+# ============================================================
+# CALL 8: Detailed Process Steps
+# ============================================================
+
+def get_detailed_process_steps(
+    transcript: str, project_name: str, entity_hint: str
+) -> List[Dict]:
+    """
+    Extract detailed step-by-step process for Section 2.4.
+    Each step becomes a subsection with optional screenshot.
+    """
+    start = time.time()
+    sample = _safe_sample(transcript, max_len=MAX_SAMPLE)
+
+    prompt = f"""Write detailed step-by-step instructions for the automated process.
+
+Project: "{project_name}". {entity_hint}
+
+Use ONLY names from the transcript.
+
+List 10-25 detailed steps describing specific screen-level actions:
+- Logging into applications
+- Navigating to specific pages/tabs
+- Clicking buttons or menu items
+- Entering data in fields
+- Downloading or exporting files
+- Processing or validating records
+- Generating reports
+- Updating status
+
+Numbered list, each step 1-2 sentences.
+
+TRANSCRIPT:
+{sample}
+
+STEPS:
+1."""
+
+    response = llm_client.generate(prompt, system_prompt=SYSTEM_PROMPT)
+    _timed("Detailed Steps", start)
+
+    detailed = []
+    if response:
+        if not response.strip().startswith("1"):
+            response = "1. " + response
+        parsed = _parse_numbered_steps(response)
+        for i, step in enumerate(parsed):
+            detailed.append({
+                "number": f"2.4.{i+1}",
+                "description": step
+            })
+
+    if not detailed:
+        detailed = [
+            {"number": "2.4.1",
+             "description": "Log in to the target application."},
+            {"number": "2.4.2",
+             "description": "Navigate to the relevant section."},
+            {"number": "2.4.3",
+             "description": "Extract and process the required data."},
+            {"number": "2.4.4",
+             "description": "Validate records against defined criteria."},
+            {"number": "2.4.5",
+             "description": "Perform required actions for validated records."},
+            {"number": "2.4.6",
+             "description": "Generate reports and update execution status."},
+        ]
+    return detailed
+
+
+# ============================================================
+# CALL 9: Interface Requirements
+# ============================================================
+
+def get_interface_requirements(transcript: str, entities: Dict) -> List[Dict]:
+    """Extract interface/application requirements."""
+    start = time.time()
+    sample = _safe_sample(transcript, max_len=MAX_SAMPLE_SMALL)
+    apps_hint = ""
+    if entities.get('applications'):
+        apps_hint = (
+            f"Applications from transcript: "
+            f"{', '.join(entities['applications'])}"
+        )
+
+    prompt = f"""Identify application interfaces needed for this automation.
+
+{apps_hint}
+
+ONLY list applications explicitly mentioned in the transcript.
+
+FORMAT (one per line):
+APP: Name | INTERFACE: Web/Desktop/API/Database | PURPOSE: Why needed
+
+TRANSCRIPT:
+{sample}
+
+INTERFACES:"""
+
+    response = llm_client.generate(prompt, system_prompt=SYSTEM_PROMPT)
+    _timed("Interfaces", start)
+
+    apps = []
+    if response:
+        for line in response.split('\n'):
+            line = line.strip()
+            if '|' in line and 'APP' in line.upper():
+                app = {
+                    "application": "", "interface": "",
+                    "url": "", "purpose": ""
+                }
+                parts = line.split('|')
+                for part in parts:
+                    part = part.strip()
+                    p_up = part.upper()
+                    if p_up.startswith('APP'):
+                        app["application"] = re.sub(
+                            r'^APP(?:LICATION)?:\s*', '', part,
+                            flags=re.IGNORECASE
+                        ).strip()
+                    elif p_up.startswith('INTERFACE'):
+                        app["interface"] = part.split(':', 1)[-1].strip()
+                    elif p_up.startswith('PURPOSE'):
+                        app["purpose"] = part.split(':', 1)[-1].strip()
                 if app["application"]:
-                    applications.append(app)
-    
-    return applications if applications else [{"application": "", "interface": "", "url": "", "purpose": ""}]
+                    apps.append(app)
+
+    if not apps:
+        apps = [{
+            "application": "N/A", "interface": "N/A",
+            "url": "N/A", "purpose": "N/A"
+        }]
+    return apps
 
 
-def identify_key_timestamps(transcript: str, transcript_path: str) -> List[Dict]:
+# ============================================================
+# CALL 10: Exception Handling
+# ============================================================
+
+def get_exception_handling(
+    transcript: str, project_name: str, entity_hint: str
+) -> List[Dict]:
+    """Generate exception handling scenarios."""
+    start = time.time()
+    sample = _safe_sample(transcript, max_len=MAX_SAMPLE_SMALL)
+
+    prompt = f"""Write exception handling scenarios for this automation.
+
+Project: "{project_name}". {entity_hint}
+
+List 5-8 exceptions and how the system handles each.
+
+FORMAT (one per line):
+EXCEPTION: Scenario title | HANDLING: What the system does
+
+Consider: login failures, missing data, records not found, processing errors, validation failures, system errors.
+
+TRANSCRIPT:
+{sample}
+
+EXCEPTIONS:"""
+
+    response = llm_client.generate(prompt, system_prompt=SYSTEM_PROMPT)
+    _timed("Exceptions", start)
+
+    exceptions = []
+    if response:
+        for line in response.split('\n'):
+            line = line.strip()
+            if '|' in line and 'EXCEPTION' in line.upper():
+                parts = line.split('|')
+                exc = {"exception": "", "handling": ""}
+                for part in parts:
+                    part = part.strip()
+                    if part.upper().startswith('EXCEPTION'):
+                        exc["exception"] = re.sub(
+                            r'^EXCEPTION:\s*', '', part,
+                            flags=re.IGNORECASE
+                        ).strip()
+                    elif part.upper().startswith('HANDLING'):
+                        exc["handling"] = re.sub(
+                            r'^HANDLING:\s*', '', part,
+                            flags=re.IGNORECASE
+                        ).strip()
+                if exc["exception"]:
+                    exceptions.append(exc)
+
+    if not exceptions:
+        exceptions = [
+            {"exception": "Application Login Failure",
+             "handling": "Stop execution, log error, notify support."},
+            {"exception": "Missing or Invalid Input Data",
+             "handling": "Log failure, skip affected record."},
+            {"exception": "Record Not Found",
+             "handling": "Log details, skip, continue processing."},
+            {"exception": "Processing Error",
+             "handling": "Log error, mark failed, continue with others."},
+            {"exception": "System Exception",
+             "handling": "Capture details in error log for audit."},
+        ]
+    return exceptions
+
+
+# ============================================================
+# DOT Code Generation — Labels on NODES
+# ============================================================
+
+def generate_dot_and_apps(process_steps, transcript, entities=None):
+    """Generate DOT flowchart code and interface requirements."""
+    start = time.time()
+    if entities is None:
+        entities, _ = extract_entities_and_project(transcript)
+    dot_code = _generate_dot_from_steps(process_steps)
+    apps = get_interface_requirements(transcript, entities)
+    _timed("DOT+Apps", start)
+    return dot_code, apps
+
+
+def _generate_dot_from_steps(steps):
     """
-    Identify timestamps where actual process actions occur.
-    More accurate than keyword matching.
-    
-    Args:
-        transcript: Full transcript text.
-        transcript_path: Path to timestamped transcript file.
-        
-    Returns:
-        List of {timestamp, action, description} dicts.
+    Generate DOT code from process steps.
+    Labels on NODES, simple edges, decisions with Yes/No.
     """
-    # Read timestamped transcript
-    timestamped_lines = []
+    if not steps:
+        return _manual_dot(["Start", "Process", "End"])
+    chart = steps[:12]
+    text = "\n".join([f"{i+1}. {s}" for i, s in enumerate(chart)])
+
+    prompt = f"""Convert these steps into Graphviz DOT flowchart code.
+
+RULES:
+1. Descriptive text goes in NODE labels: Step1 [label="Connect to App"]
+2. Edges are simple arrows: Step1 -> Step2;
+3. ONLY decision edges get labels: Decision1 -> Step3 [label="Yes"];
+4. Start/End: shape=oval. Steps: shape=box. Decisions: shape=diamond.
+5. Keep labels short (max 6-8 words).
+6. Every node MUST have label="..."
+
+Output ONLY DOT code.
+
+Steps:
+{text}
+
+digraph ProcessFlow {{"""
+
+    response = llm_client.generate(prompt, temperature=0.2)
+    if response:
+        dot = _extract_dot(response)
+        if dot and re.search(r'\w+\s*\[.*?label\s*=', dot, re.IGNORECASE):
+            return dot
+        else:
+            print("    [DOT] LLM output invalid, using manual generation")
+    return _manual_dot(steps)
+
+
+def _extract_dot(response):
+    """Extract DOT code from LLM response."""
+    m = re.search(r'```(?:dot|graphviz|)?\s*\n?(.*?)```', response, re.DOTALL)
+    if m and 'digraph' in m.group(1):
+        return m.group(1).strip()
+    m = re.search(r'(digraph\s+\w*\s*\{.*\})', response, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    if 'digraph' in response and '->' in response:
+        text = response.strip()
+        if not text.startswith('digraph'):
+            text = 'digraph ProcessFlow {\n' + text
+        if not text.endswith('}'):
+            text += '\n}'
+        return text
+    return None
+
+
+def _manual_dot(steps):
+    """Generate DOT code manually. Labels on nodes, simple edges."""
+    lines = [
+        'digraph ProcessFlow {',
+        '    rankdir=TB;',
+        '    node [fontname="Arial", fontsize=10, style=filled];',
+        '    edge [fontname="Arial", fontsize=9];',
+        '',
+        '    Start [label="Start", shape=oval, fillcolor=lightgreen];'
+    ]
+    ids = ['Start']
+
+    for i, s in enumerate(steps[:15]):
+        nid = f'Step{i+1}'
+        label = s.replace('[DECISION]', '').strip().replace('"', '\\"')
+        words = label.split()
+        if len(words) > 8:
+            label = ' '.join(words[:8]) + '...'
+        if len(label) > 35:
+            w = label.split()
+            m = len(w) // 2
+            label = ' '.join(w[:m]) + '\\n' + ' '.join(w[m:])
+
+        is_decision = '[DECISION]' in s
+        shape = 'diamond' if is_decision else 'box'
+        color = 'gold' if is_decision else 'lightblue'
+        lines.append(
+            f'    {nid} [label="{label}", shape={shape}, fillcolor={color}];'
+        )
+        ids.append(nid)
+
+    lines.append('    End [label="End", shape=oval, fillcolor=lightcoral];')
+    ids.append('End')
+    lines.append('')
+
+    for i in range(len(ids) - 1):
+        lines.append(f'    {ids[i]} -> {ids[i+1]};')
+
+    lines.append('}')
+    return '\n'.join(lines)
+
+
+# ============================================================
+# Timestamps + Paraphrase
+# ============================================================
+
+def identify_key_timestamps(transcript, transcript_path):
+    """Identify key action timestamps from transcript."""
+    start = time.time()
+    lines = []
     try:
         with open(transcript_path, 'r', encoding='utf-8') as f:
             for line in f:
-                match = re.match(r'\[(\d+\.?\d*)\s*-\s*(\d+\.?\d*)\]\s+(.*)', line.strip())
-                if match:
-                    start = float(match.group(1))
-                    text = match.group(3).strip()
-                    timestamped_lines.append({"timestamp": start, "text": text})
-    except:
+                m = re.match(
+                    r'\[(\d+\.?\d*)\s*-\s*(\d+\.?\d*)\]\s+(.*)',
+                    line.strip()
+                )
+                if m:
+                    lines.append({
+                        "timestamp": float(m.group(1)),
+                        "text": m.group(3).strip()
+                    })
+    except Exception:
         return []
-    
-    if not timestamped_lines:
+    if not lines:
         return []
-    
-    # Sample lines for LLM analysis (every Nth line to cover full video)
-    step = max(1, len(timestamped_lines) // 30)
-    sampled = timestamped_lines[::step][:30]
-    
-    lines_text = "\n".join([f"[{l['timestamp']:.1f}s] {l['text']}" for l in sampled])
-    
-    prompt = f"""Analyze these transcript lines and identify which ones describe KEY PROCESS ACTIONS that should have screenshots.
 
-Good actions to capture (respond YES):
-- Opening an application or website
-- Clicking a button or menu
-- Entering data in a form
-- Submitting or saving something
-- Viewing results or reports
-- Decision points or validations
+    step = max(1, len(lines) // 20)
+    sampled = lines[::step][:20]
+    text = "\n".join(
+        [f"[{l['timestamp']:.1f}] {l['text']}" for l in sampled]
+    )
 
-NOT good for screenshots (respond NO):
-- General conversation or greetings
-- Explaining what will happen (not doing it)
-- Asking questions
-- Describing background information
+    prompt = f"""Which lines show a PROCESS ACTION (opening app, clicking, typing, navigating)?
+NOT: talking, explaining, greeting.
 
-For each line, respond:
-[timestamp] YES/NO - Brief action description (if YES)
+Per line: [time] YES action  OR  [time] NO
 
-Transcript lines:
-{lines_text}
+{text}
 
-Analysis:"""
+Answers:"""
 
-    response = llm_client.generate_with_stream(prompt)
-    
-    key_moments = []
-    
+    response = llm_client.generate(prompt)
+    moments = []
     if response:
         for line in response.split('\n'):
-            match = re.search(r'\[(\d+\.?\d*)s?\]\s*YES\s*[-:]\s*(.*)', line, re.IGNORECASE)
-            if match:
-                timestamp = float(match.group(1))
-                description = match.group(2).strip()
-                key_moments.append({
-                    "timestamp": timestamp,
-                    "description": description
+            m = re.search(
+                r'\[?(\d+\.?\d*)\]?\s*YES\s*[-:.]?\s*(.*)',
+                line, re.IGNORECASE
+            )
+            if m:
+                ts = float(m.group(1))
+                desc = m.group(2).strip()
+                if not desc:
+                    for sl in sampled:
+                        if abs(sl["timestamp"] - ts) < 1.0:
+                            desc = sl["text"]
+                            break
+                moments.append({
+                    "timestamp": ts,
+                    "description": desc or "Process action"
                 })
-    
-    # Limit to ~15 key moments, spread across video
-    if len(key_moments) > 15:
-        step = len(key_moments) // 15
-        key_moments = key_moments[::step][:15]
-    
-    return key_moments
+
+    # Fallback: keyword matching
+    if len(moments) < 3:
+        all_kw = set()
+        for kl in ACTION_KEYWORDS.values():
+            for kw in kl:
+                all_kw.add(kw.lower())
+        for tl in lines:
+            if any(kw in tl["text"].lower() for kw in all_kw):
+                moments.append({
+                    "timestamp": tl["timestamp"],
+                    "description": tl["text"]
+                })
+
+    # Deduplicate
+    if moments:
+        deduped = [moments[0]]
+        for km in moments[1:]:
+            if abs(km["timestamp"] - deduped[-1]["timestamp"]) > 5.0:
+                deduped.append(km)
+        moments = deduped
+
+    if len(moments) > 15:
+        s = len(moments) // 15
+        moments = moments[::s][:15]
+
+    _timed(f"Timestamps ({len(moments)})", start)
+    return moments
 
 
-def paraphrase_transcript(text: str) -> str:
-    """Paraphrase transcript text into professional description."""
-    if len(text) > 400:
-        text = text[:400]
-    
-    prompt = f"""Convert this transcript text into a professional step description (1-2 sentences).
-
-Rules:
-- Use third person (e.g., "The user clicks..." not "I click...")
-- Be specific about the action
-- Mention the application/field name if present
-- Fix any transcription errors
-
-Text: "{text}"
-
-Step Description:"""
-
-    response = llm_client.generate(prompt, timeout=60)
-    return response.strip() if response else text
-
-
-def paraphrase_batch(texts: List[str], batch_size: int = 5) -> List[str]:
-    """Paraphrase multiple texts efficiently in batches."""
+def paraphrase_batch(texts, batch_size=5):
+    """Paraphrase frame descriptions into professional process steps."""
+    if not texts:
+        return []
     results = []
-    
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i + batch_size]
-        
-        numbered = "\n".join([f"{j+1}. \"{t[:120]}\"" for j, t in enumerate(batch)])
-        
-        prompt = f"""Convert each transcript line into a professional step description.
+        numbered = "\n".join(
+            [f"{j+1}. {t[:100]}" for j, t in enumerate(batch)]
+        )
 
-Rules:
-- Use third person ("The user..." not "I...")
-- Be specific and concise (1 sentence each)
-- Fix any obvious transcription errors
-- Keep the same numbering
+        prompt = f"""Rewrite each as a professional process step description.
+What the SYSTEM does at this point. Third person, 1 sentence each.
+Use ONLY names from the original text.
 
 {numbered}
 
-Professional Descriptions:"""
-        
-        response = llm_client.generate_with_stream(prompt)
-        
+Rewritten:
+1."""
+
+        response = llm_client.generate(prompt, system_prompt=SYSTEM_PROMPT)
+        batch_results = []
         if response:
-            lines = [l.strip() for l in response.split('\n') if l.strip()]
-            for line in lines:
-                clean = re.sub(r'^[\d]+[\.\)]\s*', '', line).strip()
-                clean = clean.strip('"')
-                if clean:
-                    results.append(clean)
-        
-        while len(results) < i + len(batch):
-            idx = len(results) - i
-            if idx < len(batch):
-                results.append(batch[idx][:80])
-            else:
-                break
-    
+            if not response.strip().startswith("1"):
+                response = "1. " + response
+            batch_results = _parse_numbered_steps(response)
+        for j in range(len(batch)):
+            results.append(
+                batch_results[j] if j < len(batch_results)
+                else batch[j][:120]
+            )
     return results
 
 
-if __name__ == "__main__":
-    if llm_client.is_available():
-        print("✓ Ollama connected")
-        
-        test = """
-        In this meeting we will discuss the Ivanti ticketing process.
-        First, open the Ivanti Service Management portal in your browser.
-        Navigate to the tickets section and search for open tickets.
-        Select a ticket and update its status.
-        """
-        
-        print("\nTesting entity extraction...")
-        entities = extract_entities(test)
-        print(f"Entities: {entities}")
-        
-        print("\nTesting project name...")
-        name = get_project_name(test)
-        print(f"Project: {name}")
-    else:
-        print("✗ Ollama not available")
+# ============================================================
+# Backward compat wrappers
+# ============================================================
+
+def get_purpose_summary_io(transcript, project_name, entities=None):
+    if entities is None:
+        entities, _ = extract_entities_and_project(transcript)
+    eh = _build_entity_hint(entities)
+    return {
+        "purpose": get_document_purpose_text(transcript, project_name, eh),
+        "summary": get_to_be_process(transcript, project_name, eh),
+        "inputs_outputs": get_as_is_process(transcript, project_name, eh),
+        "overview": "", "justification": "", "as_is": "", "to_be": ""
+    }
+
+
+def extract_entities(t):
+    return extract_entities_and_project(t)[0]
+
+def get_project_name(t):
+    return extract_entities_and_project(t)[1]
+
+def get_document_purpose(t, pn):
+    return get_document_purpose_text(t, pn, "")
+
+def get_process_summary(t, e=None):
+    return get_to_be_process(t, "Process", "")
+
+def get_inputs_outputs(t, e=None):
+    return get_as_is_process(t, "Process", "")
+
+def generate_dot_code(t, e=None):
+    s = extract_process_steps(t, e)
+    d, _ = generate_dot_and_apps(s, t, e)
+    return d
+
+def get_applications_table(t, e=None):
+    s = extract_process_steps(t, e)
+    _, a = generate_dot_and_apps(s, t, e)
+    return a

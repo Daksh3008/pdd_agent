@@ -1,436 +1,459 @@
 # src/pdd_document.py
+
 """
-PDD (Process Definition Document) Generator.
-Creates professional Word documents with proper formatting.
+PDD/BRD Document Generator.
+Technology-neutral, configurable document structure.
+Section 2.4 "High Level To Be Detailed Process" with sub-numbered steps and screenshots.
 """
 
 import os
-from typing import List, Tuple, Dict
+import re
+from typing import List, Tuple, Dict, Optional
 from docx import Document
-from docx.shared import Pt, Inches, RGBColor, Twips
+from docx.shared import Pt, Inches, RGBColor, Cm
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
+from config import doc_config
+
 
 class PDDGenerator:
-    """Generator for Process Definition Documents."""
-    
+
     def __init__(self):
         self.doc = Document()
         self._setup_styles()
-    
+        self._setup_margins()
+
     def _setup_styles(self):
-        """Configure document styles."""
-        # Set default font
         style = self.doc.styles['Normal']
         style.font.name = 'Arial'
         style.font.size = Pt(11)
-    
-    def _add_heading(
-        self,
-        text: str,
-        level: int = 1,
-        color: str = "0D3B66",
-        space_before: int = 12,
-        space_after: int = 6
-    ):
-        """Add a styled heading with proper spacing."""
-        heading = self.doc.add_paragraph()
-        
-        # Set spacing
-        heading.paragraph_format.space_before = Pt(space_before)
-        heading.paragraph_format.space_after = Pt(space_after)
-        
-        run = heading.add_run(text)
-        run.bold = True
-        run.font.name = 'Arial'
-        
-        # Set font size based on level
-        sizes = {1: 14, 2: 12, 3: 11}
-        run.font.size = Pt(sizes.get(level, 11))
-        
-        # Set color
-        run.font.color.rgb = RGBColor.from_string(color)
-        heading.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
-    
-    def _add_paragraph(self, text: str, space_after: int = 8):
-        """Add a paragraph with proper spacing."""
-        para = self.doc.add_paragraph(text)
-        para.paragraph_format.space_after = Pt(space_after)
-        return para
-    
-    def _create_table(
-        self,
-        data: List[List[str]],
-        header_color: str = "4F81BD",
-        col_widths: List[float] = None
-    ):
-        """Create a styled table with proper formatting."""
+
+    def _setup_margins(self):
+        """Set narrow margins on all sections."""
+        margin = Inches(doc_config.margin_inches)
+        for section in self.doc.sections:
+            section.top_margin = margin
+            section.bottom_margin = margin
+            section.left_margin = margin
+            section.right_margin = margin
+
+    def _heading(self, text, level=1, color="0D3B66", before=12, after=6):
+        p = self.doc.add_paragraph()
+        p.paragraph_format.space_before = Pt(before)
+        p.paragraph_format.space_after = Pt(after)
+        r = p.add_run(text)
+        r.bold = True
+        r.font.name = 'Arial'
+        r.font.size = Pt({1: 14, 2: 12, 3: 11}.get(level, 11))
+        r.font.color.rgb = RGBColor.from_string(color)
+
+    def _para(self, text, after=8):
+        p = self.doc.add_paragraph(text)
+        p.paragraph_format.space_after = Pt(after)
+        return p
+
+    def _table(self, data, header_color="4F81BD", widths=None):
         if not data:
             return
-        
-        table = self.doc.add_table(
-            rows=len(data),
-            cols=len(data[0]),
-            style="Table Grid"
-        )
-        table.alignment = WD_TABLE_ALIGNMENT.CENTER
-        
-        # Set column widths if provided
-        if col_widths:
-            for i, width in enumerate(col_widths):
-                for row in table.rows:
-                    row.cells[i].width = Inches(width)
-        
-        for row_idx, row_data in enumerate(data):
-            for col_idx, cell_text in enumerate(row_data):
-                cell = table.cell(row_idx, col_idx)
-                cell.text = str(cell_text)
-                
-                # Style cell paragraph
-                for para in cell.paragraphs:
-                    para.paragraph_format.space_before = Pt(4)
-                    para.paragraph_format.space_after = Pt(4)
-                
-                if row_idx == 0:  # Header row
+        t = self.doc.add_table(rows=len(data), cols=len(data[0]), style="Table Grid")
+        t.alignment = WD_TABLE_ALIGNMENT.CENTER
+        if widths:
+            for i, w in enumerate(widths):
+                for row in t.rows:
+                    row.cells[i].width = Inches(w)
+        for ri, rd in enumerate(data):
+            for ci, ct in enumerate(rd):
+                cell = t.cell(ri, ci)
+                cell.text = str(ct)
+                for p in cell.paragraphs:
+                    p.paragraph_format.space_before = Pt(3)
+                    p.paragraph_format.space_after = Pt(3)
+                if ri == 0:
                     cell.paragraphs[0].alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-                    for run in cell.paragraphs[0].runs:
-                        run.bold = True
-                    
-                    # Add shading
-                    shading = OxmlElement("w:shd")
-                    shading.set(qn("w:fill"), header_color)
-                    tc_pr = cell._element.get_or_add_tcPr()
-                    tc_pr.append(shading)
-        
-        # Add space after table
+                    for r in cell.paragraphs[0].runs:
+                        r.bold = True
+                    shd = OxmlElement("w:shd")
+                    shd.set(qn("w:fill"), header_color)
+                    cell._element.get_or_add_tcPr().append(shd)
         self.doc.add_paragraph()
-    
+
     def generate(
         self,
         project_name: str,
-        process_summary: str,
-        inputs_outputs: str,
-        flowchart_path: str,
+        process_summary: str = "",
+        inputs_outputs: str = "",
+        flowchart_path: str = "",
         document_purpose: str = None,
         applications: List[Dict] = None,
-        output_path: str = "PDD_Document.docx"
+        process_steps: List[str] = None,
+        output_path: str = "PDD.docx",
+        overview: str = None,
+        justification: str = None,
+        as_is: str = None,
+        to_be: str = None,
+        input_requirements: List[Dict] = None,
+        exception_handling: List[Dict] = None,
+        detailed_steps: List[Dict] = None
     ) -> str:
-        """
-        Generate complete PDD document.
-        
-        Args:
-            project_name: Name of the project.
-            process_summary: Process summary text.
-            inputs_outputs: Inputs and outputs text.
-            flowchart_path: Path to flowchart image.
-            document_purpose: Custom document purpose (optional).
-            applications: List of application dicts (optional).
-            output_path: Output document path.
-            
-        Returns:
-            Path to generated document.
-        """
+        """Generate complete PDD/BRD document."""
+
+        doc_type = doc_config.document_type
+        doc_type_full = doc_config.document_type_full
+        steps_header = doc_config.process_steps_header
+        detailed_header = doc_config.detailed_steps_header
+
         # ===== FRONT PAGE =====
         self.doc.add_paragraph("\n\n\n")
-        
-        title = self.doc.add_paragraph()
-        title_run = title.add_run(project_name)
-        title_run.bold = True
-        title_run.font.size = Pt(28)
-        title_run.font.color.rgb = RGBColor(13, 59, 102)  # Dark blue
-        title.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-        
+        p = self.doc.add_paragraph()
+        r = p.add_run(f"{doc_type_full.upper()}")
+        r.bold = True
+        r.font.size = Pt(28)
+        r.font.color.rgb = RGBColor(13, 59, 102)
+        p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+
         self.doc.add_paragraph("\n")
-        
-        subtitle = self.doc.add_paragraph()
-        sub_run = subtitle.add_run("Process Definition Document (PDD)")
-        sub_run.font.size = Pt(18)
-        sub_run.font.color.rgb = RGBColor(100, 100, 100)
-        subtitle.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-        
-        self.doc.add_paragraph("\n\n\n")
-        
-        # Document info
-        info = self.doc.add_paragraph()
-        info.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-        info_run = info.add_run("CONFIDENTIAL")
-        info_run.font.size = Pt(12)
-        info_run.font.color.rgb = RGBColor(150, 0, 0)
-        
+        p = self.doc.add_paragraph()
+        r = p.add_run(project_name.upper())
+        r.bold = True
+        r.font.size = Pt(18)
+        r.font.color.rgb = RGBColor(100, 100, 100)
+        p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+
+        if doc_config.confidential:
+            self.doc.add_paragraph("\n\n")
+            p = self.doc.add_paragraph()
+            p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+            r = p.add_run("CONFIDENTIAL")
+            r.font.size = Pt(12)
+            r.font.color.rgb = RGBColor(150, 0, 0)
+
         self.doc.add_page_break()
-        
-        # ===== TABLE OF CONTENTS =====
-        self._add_heading("TABLE OF CONTENTS", 1, space_before=0)
-        
-        toc_items = [
-            "1. Document Control",
-            "    1.1 Version Control",
-            "    1.2 Document Review and Sign-Off",
-            "2. General Process Description",
-            "    2.1 Document Purpose",
-            "    2.2 Process Summary",
-            "    2.3 Applications Used",
-            "    2.4 Inputs and Outputs",
-            "    2.5 High-Level Process Flow",
-            "3. Exception Handling",
-            "    3.1 Known Exceptions",
-            "    3.2 Unknown Exceptions",
-            "4. Step-by-Step Process Documentation"
+
+        # ===== VERSION INFO =====
+        self._heading("Template Version Information", 2, before=0)
+        self._table([
+            ["Author", "Business Unit", "Classification", "Status", "Version"],
+            ["", "", doc_config.classification, doc_config.status, doc_config.version]
+        ], widths=[1.5, 1.5, 1.3, 1.3, 0.8])
+
+        self.doc.add_page_break()
+
+        # ===== REVIEW & APPROVAL =====
+        self._heading("REVIEW & APPROVAL", 1, before=0)
+        self._table([
+            ["Project Name", project_name, "Project ID", ""],
+            ["Document", f"{doc_type_full} ({doc_type})", "Version", doc_config.version]
+        ], widths=[1.5, 2.5, 1.0, 1.0])
+        self._table([
+            ["Name", "Title / Position", "Date", "Signature"],
+            ["", "", "", ""],
+            ["", "", "", ""]
+        ], widths=[2.0, 2.0, 1.5, 1.5])
+
+        self.doc.add_page_break()
+
+        # ===== CONTENTS =====
+        self._heading("Contents", 1, before=0)
+        toc = [
+            "1  Introduction",
+            "    1.1  Purpose of this Document",
+            "    1.2  Overview and Objective",
+            "    1.3  Business Justification",
+            "2  Business Requirements",
+            "    2.1  \"As Is\" Process",
+            "    2.2  \"To Be\" Process (Automated State)",
+            "    2.2.1  Process Flow",
+            f"    2.2.2  {steps_header}",
+            "    2.3  Input Requirements",
+            f"    2.4  {detailed_header}",
+            "    2.5  Interface Requirements",
+            "3  Exception Handling",
         ]
-        
-        for item in toc_items:
-            para = self.doc.add_paragraph(item)
-            para.paragraph_format.space_after = Pt(2)
-        
+        for item in toc:
+            p = self.doc.add_paragraph(item)
+            p.paragraph_format.space_after = Pt(2)
+
         self.doc.add_page_break()
-        
-        # ===== SECTION 1: DOCUMENT CONTROL =====
-        self._add_heading("1. DOCUMENT CONTROL", 1, space_before=0)
-        
-        self._add_heading("1.1 VERSION CONTROL", 2)
-        self._create_table(
-            [
-                ["Version", "Date", "Description", "Author"],
-                ["1.0", "", "Initial Draft", ""],
-                ["", "", "", ""]
-            ],
-            col_widths=[1.0, 1.5, 2.5, 1.5]
-        )
-        
-        note = self._add_paragraph(
-            "** Document version should be updated when shared with primary stakeholders. **"
-        )
-        note.runs[0].italic = True
-        
-        self._add_heading("1.2 DOCUMENT REVIEW AND SIGN-OFF", 2)
-        self._create_table(
-            [
-                ["Name", "Business Role", "Action", "Date"],
-                ["", "", "", ""],
-                ["", "", "", ""]
-            ],
-            col_widths=[2.0, 2.0, 1.5, 1.5]
-        )
-        
-        self.doc.add_page_break()
-        
-        # ===== SECTION 2: GENERAL PROCESS DESCRIPTION =====
-        self._add_heading("2. GENERAL PROCESS DESCRIPTION", 1, space_before=0)
-        
-        self._add_heading("2.1 DOCUMENT PURPOSE", 2)
-        
+
+        # ===== 1. INTRODUCTION =====
+        self._heading("1  INTRODUCTION", 1, before=0)
+
+        self._heading("1.1  PURPOSE OF THIS DOCUMENT", 2)
         if document_purpose:
-            # Use custom document purpose
-            for para_text in document_purpose.split('\n\n'):
-                if para_text.strip():
-                    self._add_paragraph(para_text.strip())
+            for para in document_purpose.split('\n\n'):
+                if para.strip():
+                    self._para(para.strip())
         else:
-            # Default purpose
-            self._add_paragraph(
-                f"The purpose of this Process Definition Document (PDD) is to capture the "
-                f"business-related details of the {project_name} process. It describes how "
-                f"the automated solution will operate and serves as a key input for the "
-                f"technical design of the solution."
+            self._para(
+                f"This document defines the requirements for the "
+                f"{project_name} automation."
             )
-            
-            self._add_paragraph("This document ensures:")
-            self._add_paragraph("• Process requirements are captured in line with organizational standards")
-            self._add_paragraph("• Detailed information on the process flow and step-by-step procedures is provided")
-            self._add_paragraph("• Stakeholders have a clear understanding of the expected results and objectives")
-        
-        self._add_heading("2.2 PROCESS SUMMARY", 2)
-        
-        # Handle multi-paragraph summaries
-        for para_text in process_summary.split('\n\n'):
-            if para_text.strip():
-                self._add_paragraph(para_text.strip())
-        
-        self._add_heading("2.3 APPLICATIONS USED", 2)
-        
+
+        self._heading("1.2  OVERVIEW AND OBJECTIVE", 2)
+        if overview:
+            for line in overview.split('\n'):
+                line = line.strip()
+                if line:
+                    self._para(
+                        line,
+                        after=3 if line.startswith(('•', '-', '*')) else 8
+                    )
+        else:
+            self._para(
+                f"The primary objective is to automate the "
+                f"{project_name} process."
+            )
+
+        self._heading("1.3  BUSINESS JUSTIFICATION", 2)
+        if justification:
+            for line in justification.split('\n'):
+                if line.strip():
+                    self._para(line.strip())
+        else:
+            self._para(
+                f"The {project_name} delivers operational efficiency."
+            )
+
+        self.doc.add_page_break()
+
+        # ===== 2. BUSINESS REQUIREMENTS =====
+        self._heading("2  BUSINESS REQUIREMENTS", 1, before=0)
+
+        # 2.1 As-Is
+        self._heading("2.1  \"AS IS\" PROCESS", 2)
+        if as_is:
+            for line in as_is.split('\n'):
+                if line.strip():
+                    self._para(line.strip())
+        else:
+            self._para("Current manual process to be documented.")
+
+        self.doc.add_page_break()
+
+        # 2.2 To-Be
+        self._heading("2.2  \"TO BE\" PROCESS (AUTOMATED STATE)", 2)
+        tb = to_be or process_summary
+        if tb:
+            for para in tb.split('\n\n'):
+                if para.strip():
+                    self._para(para.strip())
+
+        # 2.2.1 Process Flow
+        self._heading("2.2.1  PROCESS FLOW", 3)
+        if flowchart_path and os.path.exists(flowchart_path):
+            self.doc.add_picture(flowchart_path, width=Inches(6.5))
+            self.doc.paragraphs[-1].alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+            p = self.doc.add_paragraph()
+            p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+            r = p.add_run(f"Figure 1: {project_name} Process Flow")
+            r.italic = True
+            r.font.size = Pt(10)
+        else:
+            self._para("[Flowchart to be inserted]")
+
+        self.doc.add_paragraph()
+
+        # 2.2.2 Process Steps
+        self._heading(f"2.2.2  {steps_header.upper()}", 3)
+        if process_steps:
+            data = [["SL #", steps_header]]
+            for i, step in enumerate(process_steps):
+                data.append([
+                    str(i + 1),
+                    step.replace('[DECISION]', '').strip()
+                ])
+            self._table(data, widths=[0.5, 6.0])
+        else:
+            self._para("Process steps to be documented.")
+
+        # 2.3 Input Requirements
+        self._heading("2.3  INPUT REQUIREMENTS", 2)
+        if input_requirements:
+            data = [["SL #", "Input Parameter", "Description"]]
+            for i, inp in enumerate(input_requirements):
+                data.append([
+                    str(i + 1),
+                    inp.get("parameter", ""),
+                    inp.get("description", "")
+                ])
+            self._table(data, widths=[0.5, 2.0, 4.0])
+        else:
+            self._table([
+                ["SL #", "Input Parameter", "Description"],
+                ["1", "", ""],
+                ["2", "", ""]
+            ], widths=[0.5, 2.0, 4.0])
+
+        self.doc.add_page_break()
+
+        # 2.4 HIGH LEVEL TO BE DETAILED PROCESS
+        self._heading(f"2.4  {detailed_header.upper()}", 2)
+
+        if detailed_steps:
+            for ds in detailed_steps:
+                p = self.doc.add_paragraph()
+                p.paragraph_format.space_before = Pt(10)
+                p.paragraph_format.space_after = Pt(8)
+                r = p.add_run(f"{ds['number']}. {ds['description']}")
+                r.bold = True
+                r.font.size = Pt(11)
+                r.font.name = 'Arial'
+        else:
+            self._para(
+                "Detailed process steps with screenshots to be documented."
+            )
+
+        self.doc.add_page_break()
+
+        # 2.5 Interface Requirements
+        self._heading("2.5  INTERFACE REQUIREMENTS", 2)
         if applications:
-            app_data = [["Application", "Interface", "Key Operation / URL", "Purpose"]]
-            for app in applications:
-                app_data.append([
+            data = [["SL #", "Interface Requirement", "Description"]]
+            for i, app in enumerate(applications):
+                data.append([
+                    str(i + 1),
                     app.get("application", ""),
-                    app.get("interface", ""),
-                    app.get("url", ""),
                     app.get("purpose", "")
                 ])
-            self._create_table(app_data, col_widths=[1.8, 1.3, 2.0, 1.8])
+            self._table(data, widths=[0.5, 2.5, 3.5])
         else:
-            self._create_table(
-                [
-                    ["Application", "Interface", "Key Operation / URL", "Purpose"],
-                    ["", "", "", ""],
-                    ["", "", "", ""]
-                ],
-                col_widths=[1.8, 1.3, 2.0, 1.8]
-            )
-        
-        self._add_heading("2.4 INPUTS AND OUTPUTS", 2)
-        
-        # Format inputs/outputs properly
-        for line in inputs_outputs.split('\n'):
-            line = line.strip()
-            if line:
-                if line.startswith('**') and line.endswith('**'):
-                    # Bold header
-                    para = self.doc.add_paragraph()
-                    run = para.add_run(line.strip('*'))
-                    run.bold = True
-                    para.paragraph_format.space_before = Pt(8)
-                    para.paragraph_format.space_after = Pt(4)
-                elif line.startswith('➤') or line.startswith('-'):
-                    self._add_paragraph(line, space_after=2)
-                else:
-                    self._add_paragraph(line)
-        
-        # Add spacing before flowchart
-        self.doc.add_paragraph()
-        
-        self._add_heading("2.5 HIGH-LEVEL PROCESS FLOW", 2)
-        
-        if flowchart_path and os.path.exists(flowchart_path):
-            # Add flowchart with proper sizing
-            self.doc.add_picture(flowchart_path, width=Inches(6.5))
-            
-            # Center the image
-            last_para = self.doc.paragraphs[-1]
-            last_para.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-            
-            # Add caption
-            caption = self.doc.add_paragraph()
-            caption.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-            cap_run = caption.add_run(f"Figure 1: {project_name} Process Flow")
-            cap_run.italic = True
-            cap_run.font.size = Pt(10)
+            self._table([
+                ["SL #", "Interface Requirement", "Description"],
+                ["1", "", ""]
+            ], widths=[0.5, 2.5, 3.5])
+
+        self.doc.add_page_break()
+
+        # ===== 3. EXCEPTION HANDLING =====
+        self._heading("3  EXCEPTION HANDLING", 1, before=0)
+        if exception_handling:
+            data = [["Exception Scenario", "Handling Action"]]
+            for exc in exception_handling:
+                data.append([
+                    exc.get("exception", ""),
+                    exc.get("handling", "")
+                ])
+            self._table(data, widths=[2.5, 4.5])
         else:
-            self._add_paragraph("[Flowchart image not available]")
-        
-        # Important: Add proper spacing after flowchart
-        self.doc.add_paragraph()
-        self.doc.add_paragraph()
-        
-        self.doc.add_page_break()
-        
-        # ===== SECTION 3: EXCEPTION HANDLING =====
-        self._add_heading("3. EXCEPTION HANDLING", 1, space_before=0)
-        
-        self._add_paragraph(
-            "This section documents the different types of exceptions that may occur "
-            "during process execution and how they should be handled."
-        )
-        
-        self._add_heading("3.1 KNOWN EXCEPTIONS", 2)
-        self._add_paragraph(
-            "The following table lists process exceptions that have been identified "
-            "and their corresponding handling procedures:"
-        )
-        
-        self._create_table(
-            [
-                ["Exception Code", "Description", "Handling Action"],
-                ["EXC_001", "", ""],
-                ["EXC_002", "", ""],
-                ["EXC_003", "", ""]
-            ],
-            col_widths=[1.5, 3.0, 2.5]
-        )
-        
-        self._add_heading("3.2 UNKNOWN EXCEPTIONS", 2)
-        self._add_paragraph(
-            "Unknown exceptions are errors that may occur during processing that were "
-            "not previously identified. These will be logged and escalated according "
-            "to the standard exception handling procedure."
-        )
-        
-        self._create_table(
-            [
-                ["Exception Code", "Description", "Handling Action"],
-                ["ERR_UNKNOWN", "Unexpected system error", "Log error, notify support team"],
-                ["ERR_TIMEOUT", "Application timeout", "Retry operation, escalate if persistent"]
-            ],
-            col_widths=[1.5, 3.0, 2.5]
-        )
-        
-        self.doc.add_page_break()
-        
-        # ===== SECTION 4: STEP-BY-STEP =====
-        self._add_heading("4. STEP-BY-STEP PROCESS DOCUMENTATION", 1, space_before=0)
-        
-        self._add_paragraph(
-            "This section provides detailed step-by-step documentation of the process, "
-            "including screenshots captured during process execution."
-        )
-        
-        self._add_heading("4.1 DETAILED PROCESS STEPS", 2)
-        
-        # Save document
+            self._table([
+                ["Exception Scenario", "Handling Action"],
+                ["Application Login Failure",
+                 "Stop execution, log error, notify support."],
+                ["Record Not Found",
+                 "Log failure, skip, continue processing."],
+                ["Processing Error",
+                 "Log error, mark failed, continue with others."],
+                ["System Exception",
+                 "Capture in error log for audit."]
+            ], widths=[2.5, 4.5])
+
         self.doc.save(output_path)
-        print(f"PDD Document saved to: {output_path}")
+        print(f"Document saved: {output_path}")
         return output_path
-    
+
     def append_frames_with_text(
         self,
         doc_path: str,
         frame_text_pairs: List[Tuple[str, str]],
+        detailed_steps: List[Dict] = None,
         start_step: int = 1
     ):
         """
-        Append frames and descriptions to existing document.
-        
-        Args:
-            doc_path: Path to existing document.
-            frame_text_pairs: List of (frame_path, description) tuples.
-            start_step: Starting step number.
+        Append screenshots under Section 2.4 format.
+        Each frame gets a 2.4.x sub-number with bold description
+        and screenshot below.
         """
         if not os.path.exists(doc_path):
-            print(f"Document not found: {doc_path}")
             return
-        
+        if not frame_text_pairs and not detailed_steps:
+            return
+
         doc = Document(doc_path)
-        
-        for i, (frame_path, text) in enumerate(frame_text_pairs):
-            step_num = start_step + i
-            
-            # Add step heading
-            step_heading = doc.add_paragraph()
-            step_heading.paragraph_format.space_before = Pt(16)
-            run = step_heading.add_run(f"Step {step_num}")
-            run.bold = True
-            run.font.size = Pt(11)
-            
-            # Add image if exists
-            if os.path.exists(frame_path):
-                doc.add_picture(frame_path, width=Inches(5.5))
-                last_para = doc.paragraphs[-1]
-                last_para.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-                last_para.paragraph_format.space_after = Pt(8)
-            
-            # Add description
-            desc = doc.add_paragraph(text)
-            desc.paragraph_format.space_after = Pt(12)
-            
-            # Add separator line (optional)
-            if i < len(frame_text_pairs) - 1:
-                separator = doc.add_paragraph()
-                separator.paragraph_format.space_after = Pt(8)
-        
+
+        # Apply narrow margins to loaded document
+        margin = Inches(doc_config.margin_inches)
+        for section in doc.sections:
+            section.top_margin = margin
+            section.bottom_margin = margin
+            section.left_margin = margin
+            section.right_margin = margin
+
+        detailed_header = doc_config.detailed_steps_header
+
+        # Find where Section 2.4 heading is
+        section_24_idx = None
+        section_25_idx = None
+
+        for i, para in enumerate(doc.paragraphs):
+            text = para.text.strip()
+            if '2.4' in text and detailed_header.upper()[:10] in text.upper():
+                section_24_idx = i
+            elif '2.4' in text and 'HIGH LEVEL' in text.upper():
+                section_24_idx = i
+            elif '2.5' in text and 'INTERFACE' in text.upper():
+                section_25_idx = i
+                break
+
+        if section_24_idx is not None and section_25_idx is not None:
+            # Clear existing placeholder content between 2.4 and 2.5
+            for i in range(section_24_idx + 1, section_25_idx):
+                if i < len(doc.paragraphs):
+                    p = doc.paragraphs[i]
+                    for run in p.runs:
+                        run.text = ""
+                    p.text = ""
+
+        # Append detailed steps with screenshots at end of document
+        doc.add_page_break()
+
+        # Re-add the Section 2.4 heading
+        h = doc.add_paragraph()
+        h.paragraph_format.space_before = Pt(0)
+        h.paragraph_format.space_after = Pt(8)
+        r = h.add_run(f"2.4  {detailed_header.upper()}")
+        r.bold = True
+        r.font.size = Pt(12)
+        r.font.name = 'Arial'
+        r.font.color.rgb = RGBColor.from_string("0D3B66")
+
+        # Determine total steps to render
+        num_frames = len(frame_text_pairs) if frame_text_pairs else 0
+        num_detailed = len(detailed_steps) if detailed_steps else 0
+        total_steps = max(num_frames, num_detailed)
+
+        for i in range(total_steps):
+            step_num = f"2.4.{i + 1}"
+
+            # Get description
+            if detailed_steps and i < num_detailed:
+                desc = detailed_steps[i].get("description", "")
+            elif frame_text_pairs and i < num_frames:
+                desc = frame_text_pairs[i][1]
+            else:
+                desc = "Process step"
+
+            # Step sub-heading
+            p = doc.add_paragraph()
+            p.paragraph_format.space_before = Pt(14)
+            p.paragraph_format.space_after = Pt(6)
+            r = p.add_run(f"{step_num}. {desc}")
+            r.bold = True
+            r.font.size = Pt(11)
+            r.font.name = 'Arial'
+
+            # Screenshot (if available for this step)
+            if frame_text_pairs and i < num_frames:
+                frame_path = frame_text_pairs[i][0]
+                if os.path.exists(frame_path):
+                    doc.add_picture(frame_path, width=Inches(5.5))
+                    doc.paragraphs[-1].alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+                    doc.paragraphs[-1].paragraph_format.space_after = Pt(10)
+
         doc.save(doc_path)
-        print(f"Appended {len(frame_text_pairs)} steps to document")
-
-
-if __name__ == "__main__":
-    # Test document generation
-    generator = PDDGenerator()
-    generator.generate(
-        project_name="Ivanti Ticket Management",
-        process_summary="This process handles the management of IT tickets in the Ivanti system.",
-        inputs_outputs="**Inputs:**\n  ➤ Ticket ID\n  ➤ User credentials\n\n**Outputs:**\n  ➤ Updated ticket",
-        flowchart_path="",
-        document_purpose="This document describes the Ivanti ticket management automation process.",
-        output_path="test_pdd.docx"
-    )
+        print(
+            f"Appended {total_steps} detailed steps "
+            f"({num_frames} with screenshots) to Section 2.4"
+        )
