@@ -3,6 +3,7 @@
 """
 LLM Client for Ollama API.
 ALL calls use streaming. Detects HTTP 500 errors and reports them clearly.
+Integrated with TokenTracker for per-call token counting.
 """
 
 import requests
@@ -19,6 +20,11 @@ class OllamaClient:
         self.config = config or ollama_config
         self.params = params or llm_params
         self.api_url = f"{self.config.base_url}/api/generate"
+        self._tracker = None
+
+    def set_tracker(self, tracker):
+        """Attach a TokenTracker to record all calls."""
+        self._tracker = tracker
 
     def generate(
         self,
@@ -26,11 +32,20 @@ class OllamaClient:
         system_prompt: str = None,
         temperature: float = None,
         num_ctx: int = None,
-        timeout: int = None
+        timeout: int = None,
+        call_name: str = None
     ) -> Optional[str]:
         """
         Generate response from LLM using streaming.
-        Detects HTTP 500 errors (model crash/OOM) and reports clearly.
+        Records token usage if tracker is attached.
+
+        Args:
+            prompt: The prompt text.
+            system_prompt: Optional system prompt.
+            temperature: Override temperature.
+            num_ctx: Override context window.
+            timeout: Override total timeout.
+            call_name: Name for token tracking (e.g., "EntityExtraction").
         """
         total_timeout = timeout or self.params.total_timeout
         ctx = num_ctx or self.params.num_ctx
@@ -57,6 +72,8 @@ class OllamaClient:
         prompt_preview = prompt[:80].replace('\n', ' ')
 
         response_parts = []
+        actual_prompt_tokens = 0
+        actual_response_tokens = 0
 
         try:
             start = time.time()
@@ -76,7 +93,7 @@ class OllamaClient:
                 )
             )
 
-            # CHECK HTTP STATUS BEFORE READING STREAM
+            # CHECK HTTP STATUS
             if response.status_code == 500:
                 elapsed = time.time() - start
                 print(f"    [LLM] ✗ HTTP 500 from Ollama ({elapsed:.1f}s)")
@@ -85,17 +102,18 @@ class OllamaClient:
                     f"    [LLM]   Prompt was {prompt_len} chars. "
                     f"Try reducing prompt size."
                 )
-                print(
-                    f"    [LLM]   Current num_ctx={ctx}. "
-                    f"Try reducing if this persists."
-                )
                 response.close()
+                self._record_call(
+                    call_name, prompt, system_prompt, None,
+                    time.time() - start, 0, 0
+                )
                 return None
 
             if response.status_code != 200:
                 elapsed = time.time() - start
                 print(
-                    f"    [LLM] ✗ HTTP {response.status_code} ({elapsed:.1f}s)"
+                    f"    [LLM] ✗ HTTP {response.status_code} "
+                    f"({elapsed:.1f}s)"
                 )
                 try:
                     error_body = response.text[:200]
@@ -103,6 +121,10 @@ class OllamaClient:
                 except Exception:
                     pass
                 response.close()
+                self._record_call(
+                    call_name, prompt, system_prompt, None,
+                    time.time() - start, 0, 0
+                )
                 return None
 
             # Read streaming response
@@ -118,14 +140,23 @@ class OllamaClient:
                         continue
 
                     if "error" in chunk:
-                        print(f"    [LLM] ✗ Model error: {chunk['error']}")
+                        print(
+                            f"    [LLM] ✗ Model error: {chunk['error']}"
+                        )
                         break
 
                     if "response" in chunk:
                         response_parts.append(chunk["response"])
                         last_chunk_time = now
 
+                    # Capture actual token counts from final chunk
                     if chunk.get("done", False):
+                        actual_prompt_tokens = chunk.get(
+                            "prompt_eval_count", 0
+                        )
+                        actual_response_tokens = chunk.get(
+                            "eval_count", 0
+                        )
                         break
 
                 # Stall detection
@@ -150,25 +181,54 @@ class OllamaClient:
             elapsed = time.time() - start
 
             if result:
-                print(f"    [LLM] ✓ {len(result)} chars in {elapsed:.1f}s")
+                token_info = ""
+                if actual_prompt_tokens > 0:
+                    token_info = (
+                        f" [tokens: {actual_prompt_tokens}→"
+                        f"{actual_response_tokens}]"
+                    )
+                print(
+                    f"    [LLM] ✓ {len(result)} chars in "
+                    f"{elapsed:.1f}s{token_info}"
+                )
             else:
                 print(f"    [LLM] ⚠ Empty response after {elapsed:.1f}s")
+
+            # Record for tracking
+            self._record_call(
+                call_name, prompt, system_prompt, result,
+                elapsed, actual_prompt_tokens, actual_response_tokens
+            )
 
             return result if result else None
 
         except requests.exceptions.ConnectionError:
-            print(f"    [LLM] ✗ Cannot connect to {self.config.base_url}")
+            print(
+                f"    [LLM] ✗ Cannot connect to {self.config.base_url}"
+            )
+            self._record_call(
+                call_name, prompt, system_prompt, None,
+                time.time() - start if 'start' in dir() else 0, 0, 0
+            )
             return None
         except requests.exceptions.ReadTimeout:
             if response_parts:
                 result = "".join(response_parts).strip()
                 if result:
                     print(
-                        f"    [LLM] ⚠ Read timeout but got {len(result)} "
-                        f"chars — using partial"
+                        f"    [LLM] ⚠ Read timeout but got "
+                        f"{len(result)} chars — using partial"
+                    )
+                    self._record_call(
+                        call_name, prompt, system_prompt, result,
+                        time.time() - start, 0, 0
                     )
                     return result
             print(f"    [LLM] ✗ Read timeout, no data received")
+            self._record_call(
+                call_name, prompt, system_prompt, None,
+                time.time() - start, 0, 0
+            )
             return None
         except requests.exceptions.ConnectTimeout:
             print(
@@ -184,9 +244,29 @@ class OllamaClient:
                         f"    [LLM] ⚠ Error but got {len(result)} "
                         f"chars — using partial"
                     )
+                    self._record_call(
+                        call_name, prompt, system_prompt, result,
+                        time.time() - start, 0, 0
+                    )
                     return result
             print(f"    [LLM] ✗ Error: {type(e).__name__}: {e}")
             return None
+
+    def _record_call(
+        self, call_name, prompt, system_prompt, response,
+        duration, actual_prompt, actual_response
+    ):
+        """Record call to tracker if attached."""
+        if self._tracker and call_name:
+            self._tracker.record(
+                call_name=call_name,
+                prompt=prompt or "",
+                response=response or "",
+                duration=duration,
+                system_prompt=system_prompt or "",
+                actual_prompt_tokens=actual_prompt,
+                actual_response_tokens=actual_response
+            )
 
     def is_available(self) -> bool:
         """Check if Ollama server is available."""
@@ -212,15 +292,13 @@ class OllamaClient:
             return None
 
     def test_generation(self) -> bool:
-        """
-        Quick test to verify model can actually generate.
-        Useful for diagnosing 500 errors vs connection issues.
-        """
+        """Quick test to verify model can generate."""
         print("    [LLM] Running generation test...")
         result = self.generate(
             prompt="Reply with only the word: OK",
             timeout=60,
-            num_ctx=512
+            num_ctx=512,
+            call_name="Test"
         )
         if result:
             print(f"    [LLM] Test passed: '{result[:20]}'")

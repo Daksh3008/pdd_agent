@@ -25,5 +25,9 @@ Pillow>=10.1.0
 # Frontend
 streamlit>=1.30.0
 
+# vision model
+pytesseract
+
 # Utilities
 tqdm>=4.66.0
+openpyxl

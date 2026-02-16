@@ -2,102 +2,72 @@
 
 An AI-powered agent that automatically converts meeting video recordings into professional **Process Definition Documents (PDD)** used in RPA (Robotic Process Automation) projects.
 
-![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)
-![Whisper](https://img.shields.io/badge/OpenAI-Whisper-green.svg)
-![Ollama](https://img.shields.io/badge/LLM-Ollama-orange.svg)
-![License](https://img.shields.io/badge/License-MIT-yellow.svg)
 
----
-
-## 📋 Table of Contents
-
-- [Features](#-features)
-- [Architecture](#-architecture)
-- [Prerequisites](#-prerequisites)
-- [Installation](#-installation)
-- [Configuration](#-configuration)
-- [Usage](#-usage)
-- [Project Structure](#-project-structure)
-- [Troubleshooting](#-troubleshooting)
-- [Contributing](#-contributing)
-- [License](#-license)
-
----
-
-## ✨ Features
-
-| Feature | Description |
-|---------|-------------|
-| 🎥 **Video Processing** | Extract audio from video files (MP4, AVI, MOV, MKV) |
-| 🎤 **Speech-to-Text** | Transcribe audio using OpenAI's Whisper model |
-| 🤖 **AI Analysis** | Extract process information using LLM (Ollama) |
-| 📊 **Flowchart Generation** | Auto-generate process flowcharts from transcripts |
-| 🖼️ **Frame Extraction** | Capture key screenshots at action timestamps |
-| 📄 **Document Generation** | Create professional PDD Word documents |
-| 🌐 **Web Interface** | User-friendly Streamlit UI for easy uploads |
-
----
-
-## 🏗️ Architecture
-┌─────────────────────────────────────────────────────────────────┐
-│ PDD Agent Pipeline │
-├─────────────────────────────────────────────────────────────────┤
-│ │
-│ 📹 Video Input │
-│ │ │
-│ ▼ │
-│ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ │
-│ │ FFmpeg │───▶│ Whisper │───▶│ Transcript │ │
-│ │ (Audio Ext) │ │(Transcribe) │ │ .txt │ │
-│ └─────────────┘ └─────────────┘ └──────┬──────┘ │
-│ │ │
-│ ┌────────────────────────────┼───────┐ │
-│ │ LLM (Ollama) │ │ │
-│ ▼ ▼ ▼ ▼ │
-│ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────┐ │
-│ │ Project │ │ Process │ │ I/O │ │ DOT │ │
-│ │ Name │ │ Summary │ │ Extract │ │ Code │ │
-│ └──────────┘ └──────────┘ └──────────┘ └───┬────┘ │
-│ │ │
-│ ┌─────────────┐ ┌────────▼─────┐ │
-│ │ OpenCV │ │ Graphviz │ │
-│ │ (Frames) │ │ (Flowchart) │ │
-│ └──────┬──────┘ └──────┬───────┘ │
-│ │ │ │
-│ └──────────────────┬─────────────────────────┘ │
-│ ▼ │
-│ ┌─────────────────┐ │
-│ │ python-docx │ │
-│ │ (PDD Document) │ │
-│ └────────┬────────┘ │
-│ ▼ │
-│ 📄 PDD_Document.docx │
-│ │
-└─────────────────────────────────────────────────────────────────┘
+Meeting Video/Transcript
+        │
+        ▼
+┌─────────────────────┐
+│  1. Audio Extraction │  (FFmpeg: video → audio)
+│  2. Transcription    │  (Whisper: audio → timestamped text)
+│  3. Entity Extraction│  (LLM: find companies, apps, systems, project name)
+│  4. Section Generation│  (LLM: purpose, overview, as-is, to-be, steps...)
+│  5. Flowchart        │  (LLM generates DOT → Graphviz renders PNG)
+│  6. Frame Extraction │  (OpenCV: pull screenshots from video)
+│  7. Frame Matching   │  (OCR + text similarity: match frames to steps)
+│  8. Document Assembly│  (python-docx: build formatted .docx)
+└─────────────────────┘
+        │
+        ▼
+   PDD/BRD .docx Document
+   (with flowchart, screenshots, tables, sections)
 
 
----
+Module-by-Module Breakdown
+1. Input Layer 
+- FrontEnd/app.py	Streamlit UI — upload video/transcript, configure options, download output
+- main.py	CLI interface — python main.py video meeting.mp4 or python main.py transcript text.txt
 
-## 📦 Prerequisites
+2. Audio/Transcription Layer
+- src/video_to_audio.py	FFmpeg wrapper — extracts audio from video
+- src/transcribe_audio.py	Whisper wrapper — generates timestamped transcript ([0.00 - 5.23] text...). Auto-detects language; translates non-English to English
 
-### Required Software
+3. LLM Extraction Layer
+This is the brain of the system. It makes 10+ sequential LLM calls to a local Ollama server (default: qwen2.5:14b) to extract structured content from the transcript
 
-| Software | Version | Purpose |
-|----------|---------|---------|
-| **Python** | 3.10+ | Runtime environment |
-| **FFmpeg** | Latest | Audio extraction from video |
-| **Ollama** | Latest | LLM for text analysis |
-| **Graphviz** | Latest | Flowchart rendering |
+File	                LLM Calls	    Output
+entity_extraction.py	Call 1	        Companies, applications, systems, departments, project name
+document_sections.py	Calls 2–5	    Document purpose, overview/justification, as-is process, to-be process
+process_steps.py	    Calls 6, 8	    8–15 high-level automation steps + 10–25 detailed screen-level steps
+requirements.py	        Calls 7, 9, 10	Input requirements, interface requirements, exception handling
+flowchart_dot.py	    Call 11	        Graphviz DOT code (with deterministic step classification + LLM structure generation)
+timestamps.py	        Call 12+	    Key action timestamps + description paraphrasing
+system_prompt.py	    —	            PDD vs BRD system prompts (anti-hallucination rules)
+utils.py	            —	            Text sampling, chunking, entity verification, conversation filtering, step parsing
+compat.py	            —	            Backward compatibility wrappers
 
-### Hardware Requirements
 
-| Component | Minimum | Recommended |
-|-----------|---------|-------------|
-| **RAM** | 8 GB | 16 GB |
-| **Storage** | 10 GB | 20 GB |
-| **GPU** | Not required | NVIDIA GPU (for faster Whisper) |
+4. LLM client
 
----
+- src/llm_client.py	    Ollama API client — always streams responses, detects HTTP 500, handles stalls/timeouts, integrates with token tracker
+- src/config.py	        All configuration: Ollama host/model, Whisper settings, LLM parameters (context window, temperature, prompt size limits), action keywords
+
+
+5. Visual Layer
+File	                    Role
+src/frame_extractor.py	    OpenCV — extracts video frames at specific timestamps (LLM-identified, keyword-based, or evenly-spaced fallback). Builds a candidate pool of 3× the needed frames
+src/frame_matcher.py	    OCR + text similarity matching — runs Tesseract OCR on each frame, then scores every frame against every detailed step using enhanced word similarity   (with synonyms, substring matching, importance weighting). Greedy assignment with chronological fallback fill
+src/flowchart_generator.py	Renders LLM-generated DOT code via graphviz.Source (preserves subgraphs). Multi-level fallback: styled → raw → fallback parser
+
+6. Document Assembly
+File	                Role
+src/pdd_document.py	    python-docx generator — builds a complete professional document with: title page, version info, review/approval table, table of contents, all numbered sections (1.1–3.0), flowchart image, process step tables, input/exception tables, and Section 2.4 with sub-numbered detailed steps + matched screenshots
+
+7. Orchaestration & Tracking
+File	                    Role
+src/pdd_agent.py	        Main orchestrator (PDDAgent class) — coordinates the entire pipeline: transcription → LLM calls → frame extraction → matching → document generation. Handles both video and transcript-only modes
+src/token_tracker.py	    Records every LLM call's token usage (estimated + actual from Ollama), timing, and saves a CSV report
+
+
 
 ## 🚀 Installation
 

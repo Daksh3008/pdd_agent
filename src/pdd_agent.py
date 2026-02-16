@@ -2,7 +2,7 @@
 
 """
 PDD Agent - Main Orchestrator.
-Enhanced frame extraction matched to detailed steps count.
+Integrates OCR-based frame matching and token tracking.
 """
 
 import os
@@ -12,6 +12,7 @@ from typing import Optional, List, Tuple, Dict
 
 from config import path_config, whisper_config, doc_config
 from llm_client import llm_client
+from token_tracker import TokenTracker, reset_tracker
 from video_to_audio import convert_video_to_audio
 from transcribe_audio import transcribe_audio, read_transcript
 from llm_tasks import (
@@ -35,8 +36,10 @@ from frame_extractor import (
     extract_frames_with_transcripts,
     extract_frame,
     extract_evenly_spaced_frames,
-    get_video_duration
+    get_video_duration,
+    extract_timestamps_from_transcript
 )
+from frame_matcher import match_pipeline, build_candidates, OCR_AVAILABLE
 from pdd_document import PDDGenerator
 
 
@@ -79,87 +82,114 @@ class PDDAgent:
             with open(local, 'w', encoding='utf-8') as f:
                 f.write(dot_code)
 
-    def _extract_frames_for_steps(
-        self, video_path, transcript_path, transcript, frames_dir, num_steps
+    def _extract_candidate_frames(
+        self, video_path, transcript_path, transcript, frames_dir, num_target
     ):
         """
-        Extract frames matched to the number of detailed steps.
-        Ensures every step gets a screenshot.
+        Extract a POOL of candidate frames (more than needed).
+        These will be matched to steps by the frame_matcher.
+        
+        Returns list of (frame_path, transcript_text, timestamp) tuples.
         """
-        print(f"    Target: {num_steps} frames (one per detailed step)")
+        print(f"    Extracting candidate frame pool "
+              f"(target: {num_target * 3} candidates for {num_target} steps)...")
 
         os.makedirs(frames_dir, exist_ok=True)
-        frame_pairs = []
+        candidates = []
         used_timestamps = set()
 
-        # Tier 1: LLM-identified key moments
+        # Pool size: 3x the steps needed (gives matcher more choices)
+        pool_size = min(num_target * 3, 60)
+
+        # Source 1: LLM-identified key moments
         key_moments = identify_key_timestamps(transcript, transcript_path)
         if key_moments:
-            print(f"    Tier 1: LLM found {len(key_moments)} key moments")
+            print(f"    Source 1: {len(key_moments)} LLM key moments")
             for m in key_moments:
                 ts = m["timestamp"]
-                if any(abs(ts - used) < 3.0 for used in used_timestamps):
+                if any(abs(ts - used) < 2.0 for used in used_timestamps):
                     continue
                 fp = extract_frame(video_path, ts, frames_dir)
                 if fp:
-                    frame_pairs.append(
-                        (fp, m.get("description", "Process step"), ts)
-                    )
+                    candidates.append((
+                        fp, m.get("description", ""), ts
+                    ))
                     used_timestamps.add(ts)
 
-        # Tier 2: Keyword-based
-        if len(frame_pairs) < num_steps:
-            print(f"    Tier 2: Keyword-based extraction...")
+        # Source 2: Keyword-based from transcript
+        if len(candidates) < pool_size:
+            print(f"    Source 2: Keyword-based extraction...")
             keyword_pairs = extract_frames_with_transcripts(
                 video_path, transcript_path, frames_dir
             )
-            existing_paths = set(fp for fp, _, _ in frame_pairs)
+            existing_paths = set(fp for fp, _, _ in candidates)
             for fp, desc in keyword_pairs:
-                if fp not in existing_paths and len(frame_pairs) < num_steps:
-                    frame_pairs.append((fp, desc, -1))
+                if fp not in existing_paths and len(candidates) < pool_size:
+                    candidates.append((fp, desc, -1))
                     existing_paths.add(fp)
 
-        # Tier 3: Fill remaining with evenly-spaced
-        remaining = num_steps - len(frame_pairs)
+        # Source 3: Evenly spaced to fill pool
+        remaining = pool_size - len(candidates)
         if remaining > 0:
-            print(f"    Tier 3: {remaining} evenly-spaced frames...")
+            print(f"    Source 3: {remaining} evenly-spaced frames...")
             duration = get_video_duration(video_path)
             if duration > 0:
-                start_t = duration * 0.03
-                end_t = duration * 0.97
+                start_t = duration * 0.02
+                end_t = duration * 0.98
                 interval = (end_t - start_t) / (remaining + 1)
+
+                # Build transcript lookup for timestamp → text
+                transcript_lookup = {}
+                try:
+                    import re as _re
+                    with open(transcript_path, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            m = _re.match(
+                                r'\[(\d+\.?\d*)\s*-\s*(\d+\.?\d*)\]\s+(.*)',
+                                line.strip()
+                            )
+                            if m:
+                                transcript_lookup[float(m.group(1))] = (
+                                    m.group(3).strip()
+                                )
+                except Exception:
+                    pass
+
                 for i in range(remaining):
                     ts = start_t + interval * (i + 1)
-                    if any(abs(ts - used) < 2.0 for used in used_timestamps):
+                    if any(abs(ts - used) < 1.5 for used in used_timestamps):
                         ts += interval * 0.3
                     fp = extract_frame(video_path, ts, frames_dir)
                     if fp:
-                        minutes = int(ts // 60)
-                        seconds = int(ts % 60)
-                        frame_pairs.append(
-                            (fp, f"Process step at {minutes}:{seconds:02d}", ts)
-                        )
+                        # Find closest transcript text
+                        closest_text = ""
+                        min_diff = float('inf')
+                        for t_ts, t_text in transcript_lookup.items():
+                            diff = abs(t_ts - ts)
+                            if diff < min_diff:
+                                min_diff = diff
+                                closest_text = t_text
+                        candidates.append((fp, closest_text, ts))
                         used_timestamps.add(ts)
 
-        # Sort chronologically
-        with_ts = [(fp, d, t) for fp, d, t in frame_pairs if t >= 0]
-        no_ts = [(fp, d, t) for fp, d, t in frame_pairs if t < 0]
-        with_ts.sort(key=lambda x: x[2])
-        all_sorted = (with_ts + no_ts)[:num_steps]
-
-        result = [(fp, desc) for fp, desc, _ in all_sorted]
-        print(f"    Total frames: {len(result)} / {num_steps} needed")
-        return result
+        print(f"    Total candidate frames: {len(candidates)}")
+        return candidates
 
     def process_video(
         self, video_path, project_name=None,
         whisper_model=None, transcript_path=None
     ):
         t0 = time.time()
+
+        # Initialize token tracker
+        tracker = reset_tracker()
+        llm_client.set_tracker(tracker)
+
         print("=" * 60)
         print("PDD Agent")
         print(f"  Model: {llm_client.config.model}")
-        print(f"  Document type: {doc_config.document_type_full}")
+        print(f"  Document: {doc_config.document_type_full}")
+        print(f"  OCR: {'Available' if OCR_AVAILABLE else 'Not available'}")
         print("=" * 60)
 
         if not os.path.exists(video_path):
@@ -250,25 +280,48 @@ class PDDAgent:
         else:
             fc = ""
 
-        # ── Screenshots ──
-        print("\n[5/6] Screenshots...")
-        frames = []
-        if os.path.exists(video_path):
-            num_target = len(detailed) if detailed else 15
-            frames = self._extract_frames_for_steps(
+        # ── Screenshots + Matching ──
+        print("\n[5/6] Screenshots & matching...")
+        matched_frames = []
+
+        if os.path.exists(video_path) and detailed:
+            # Step 1: Extract candidate pool
+            num_steps = len(detailed)
+            raw_candidates = self._extract_candidate_frames(
                 video_path, transcript_path, transcript,
                 os.path.join(self.output_dir, "frames"),
-                num_steps=num_target
+                num_target=num_steps
             )
-            if frames:
-                print(f"  Improving {len(frames)} descriptions...")
-                texts = [desc for _, desc in frames]
-                improved = paraphrase_batch(texts)
-                frames = [
-                    (frames[i][0],
-                     improved[i] if i < len(improved) else frames[i][1])
-                    for i in range(len(frames))
+
+            if raw_candidates:
+                # Step 2: Build candidate dicts for matcher
+                frame_pairs = [
+                    (fp, desc) for fp, desc, _ in raw_candidates
                 ]
+                timestamps = [
+                    ts for _, _, ts in raw_candidates
+                ]
+                candidates = build_candidates(frame_pairs, timestamps)
+
+                # Step 3: Run matching pipeline (OCR + similarity)
+                print(f"  Running frame matcher "
+                      f"({'with OCR' if OCR_AVAILABLE else 'transcript-only'})...")
+                matched_frames = match_pipeline(
+                    candidates, detailed,
+                    run_ocr=OCR_AVAILABLE
+                )
+
+                # Step 4: Paraphrase descriptions for matched frames
+                if matched_frames:
+                    texts = [desc for _, desc in matched_frames if desc]
+                    if texts:
+                        print(f"  Improving {len(texts)} descriptions...")
+                        improved = paraphrase_batch(texts)
+                        improved_iter = iter(improved)
+                        matched_frames = [
+                            (path, next(improved_iter) if desc else "")
+                            for path, desc in matched_frames
+                        ]
 
         # ── Generate Document ──
         print("\n[6/6] Generating document...")
@@ -298,10 +351,16 @@ class PDDAgent:
         )
 
         # Append screenshots
-        if frames:
-            print(f"  Adding {len(frames)} screenshots to Section 2.4...")
+        if matched_frames:
+            valid_frames = [
+                (p, d) for p, d in matched_frames if p and os.path.exists(p)
+            ]
+            print(
+                f"  Adding {len(valid_frames)} matched screenshots "
+                f"to Section 2.4..."
+            )
             gen.append_frames_with_text(
-                doc_path, frames, detailed_steps=detailed
+                doc_path, valid_frames, detailed_steps=detailed
             )
         elif detailed:
             print(f"  Adding {len(detailed)} detailed steps (no screenshots)...")
@@ -310,12 +369,17 @@ class PDDAgent:
             )
 
         persistent = self._save_persistent(doc_path, project_name)
+
+        # ── Token Report ──
+        tracker.print_report()
+        tracker.save_csv(project_name)
+
         total = time.time() - t0
         print(f"\n{'='*60}")
         print(f"✓ Complete! {persistent}")
         print(
             f"  Steps: {len(steps)} | Detailed: {len(detailed)} | "
-            f"Frames: {len(frames)}"
+            f"Frames: {len(matched_frames)}"
         )
         print(f"  Time: {total/60:.1f}min")
         print(f"{'='*60}")
@@ -324,15 +388,21 @@ class PDDAgent:
     def process_transcript(
         self, transcript_path, project_name=None, video_path=None
     ):
-        """Process transcript only — reuses process_video if video available."""
+        """Process transcript — reuses process_video if video available."""
         if video_path and os.path.exists(video_path):
             return self.process_video(
-                video_path, project_name, transcript_path=transcript_path
+                video_path, project_name,
+                transcript_path=transcript_path
             )
 
         t0 = time.time()
+
+        # Initialize tracker
+        tracker = reset_tracker()
+        llm_client.set_tracker(tracker)
+
         print("=" * 60)
-        print(f"PDD Agent - Transcript Only")
+        print("PDD Agent - Transcript Only")
         print("=" * 60)
 
         if not os.path.exists(transcript_path):
@@ -396,6 +466,11 @@ class PDDAgent:
             )
 
         persistent = self._save_persistent(doc_path, project_name)
+
+        # Token report
+        tracker.print_report()
+        tracker.save_csv(project_name)
+
         print(f"\n✓ Done: {persistent} ({(time.time()-t0)/60:.1f}min)")
         return doc_path
 
