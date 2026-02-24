@@ -55,3 +55,46 @@ PHASE 5: Document Assembly (No LLM — python-docx)
 │   ├── Flowchart
 │   └── Troubleshooting
 └── Save to outputs/
+
+
+
+
+
+Prompt 1: Single Frame Description
+You are analyzing a screenshot from a screen recording 
+of someone demonstrating a software procedure.
+
+Describe this screen:
+1. What application or website is shown?
+2. What page/section is the user on?
+3. What UI elements are visible (buttons, menus, 
+   fields, tables, tabs)?
+4. What data or text is displayed?
+5. Is there any cursor, selection, or highlighted 
+   element visible?
+
+Be specific and factual. Only describe what you 
+actually see.
+
+
+
+Prompt 2: Pairwise Change Detection
+These are two consecutive screenshots from a screen 
+recording. The user performed an action between them.
+
+BEFORE: [image 1]
+AFTER: [image 2]
+
+What action did the user perform?
+- What was clicked, typed, or selected?
+- What changed on screen?
+- What appeared or disappeared?
+
+Describe the single action in one sentence.
+Format: "The user [action] [target] [result]"
+
+
+Prompt 3: Application Identification
+What application, website, or software tool is shown 
+in this screenshot?
+Reply with ONLY the application name. Nothing else.
