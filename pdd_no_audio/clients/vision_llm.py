@@ -3,6 +3,7 @@
 """
 Vision LLM Client for Ollama API (llama3.2-vision:11b).
 Optimized: resizes images before encoding to reduce processing time.
+Enhanced with robust error handling and response body logging.
 """
 
 import base64
@@ -50,6 +51,9 @@ class VisionLLMClient:
             buffer = io.BytesIO()
             if img.mode == 'RGBA':
                 img = img.convert('RGB')
+            elif img.mode not in ('RGB', 'L'):
+                # Convert any other mode (e.g., P, CMYK) to RGB
+                img = img.convert('RGB')
             img.save(buffer, format='JPEG', quality=image_config.jpeg_quality)
             encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
@@ -81,12 +85,40 @@ class VisionLLMClient:
         temperature: float = None,
         num_ctx: int = None,
         timeout: int = None,
-        call_name: str = None
+        call_name: str = None,
+        max_retries: int = 2
     ) -> Optional[str]:
-        """Generate response from vision LLM with images."""
+        """
+        Generate response from vision LLM with images. Retries on failure.
+        """
         total_timeout = timeout or self.params.vision_timeout
         ctx = num_ctx or self.params.num_ctx
 
+        for attempt in range(max_retries + 1):
+            result = self._generate_once(
+                prompt, image_paths, system_prompt, temperature,
+                ctx, total_timeout, call_name, attempt
+            )
+            if result is not None:
+                return result
+            if attempt < max_retries:
+                wait = 2 ** attempt
+                print(f"    [VisionLLM] Retry {attempt+1}/{max_retries} after {wait}s")
+                time.sleep(wait)
+        return None
+
+    def _generate_once(
+        self,
+        prompt: str,
+        image_paths: List[str],
+        system_prompt: str,
+        temperature: float,
+        num_ctx: int,
+        total_timeout: int,
+        call_name: str,
+        attempt: int
+    ) -> Optional[str]:
+        """Single attempt at generation."""
         encoded_images = []
         if image_paths:
             for img_path in image_paths:
@@ -103,7 +135,7 @@ class VisionLLMClient:
             "prompt": prompt,
             "stream": True,
             "options": {
-                "num_ctx": ctx,
+                "num_ctx": num_ctx,
                 "temperature": (
                     temperature if temperature is not None
                     else self.params.temperature
@@ -130,7 +162,7 @@ class VisionLLMClient:
             print(
                 f"    [VisionLLM] Sending ({prompt_len} chars, "
                 f"{num_images} img, timeout={total_timeout}s): "
-                f"\"{prompt_preview}...\""
+                f"\"{prompt_preview}...\" (attempt {attempt+1})"
             )
 
             response = requests.post(
@@ -141,16 +173,15 @@ class VisionLLMClient:
                 timeout=(self.params.connect_timeout, self.params.stream_chunk_timeout)
             )
 
-            if response.status_code == 500:
-                elapsed = time.time() - start
-                print(f"    [VisionLLM] ✗ HTTP 500 ({elapsed:.1f}s)")
-                response.close()
-                self._record(call_name, prompt, system_prompt, None, time.time() - start, 0, 0, True)
-                return None
-
+            # Log response body for non-200 to debug
             if response.status_code != 200:
                 elapsed = time.time() - start
-                print(f"    [VisionLLM] ✗ HTTP {response.status_code} ({elapsed:.1f}s)")
+                body = ""
+                try:
+                    body = response.text[:500]
+                except:
+                    pass
+                print(f"    [VisionLLM] ✗ HTTP {response.status_code} ({elapsed:.1f}s) - Response: {body}")
                 response.close()
                 self._record(call_name, prompt, system_prompt, None, time.time() - start, 0, 0, True)
                 return None
@@ -208,7 +239,6 @@ class VisionLLMClient:
                     self._record(call_name, prompt, system_prompt, result, time.time() - start, 0, 0, True)
                     return result
             print(f"    [VisionLLM] ✗ Read timeout")
-            self._record(call_name, prompt, system_prompt, None, time.time() - start, 0, 0, True)
             return None
         except requests.exceptions.ConnectTimeout:
             print(f"    [VisionLLM] ✗ Connection timeout")

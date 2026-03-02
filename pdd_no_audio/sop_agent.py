@@ -3,12 +3,14 @@
 """
 PDD Agent for Silent Screen Recordings — Main Orchestrator.
 Scales frame extraction and vision calls with video duration.
-Saves flowchart to persistent outputs/ directory.
+Auth-aware: detects login/logout screens and ensures proper documentation.
+Optimized: parallel OCR, parallel step synthesis, parallel section generation.
 """
 
 import os
 import time
 import shutil
+import concurrent.futures
 from typing import Optional, Dict, List
 
 from pdd_no_audio.config import (
@@ -21,7 +23,7 @@ from pdd_no_audio.clients.vision_llm import vision_client
 from pdd_no_audio.token_tracker import TokenTracker, reset_tracker
 from pdd_no_audio.frame_extraction.scene_detector import detect_scene_changes, get_video_info
 from pdd_no_audio.frame_extraction.smart_sampler import select_key_frames, compute_target_frames
-from pdd_no_audio.frame_analysis.ocr_engine import ocr_batch, OCR_AVAILABLE
+from pdd_no_audio.frame_analysis.ocr_engine import ocr_frame, OCR_AVAILABLE
 from pdd_no_audio.frame_analysis.vision_describer import (
     analyze_transitions_smart, identify_application
 )
@@ -29,17 +31,11 @@ from pdd_no_audio.frame_analysis.change_detector import detect_changes_between_f
 from pdd_no_audio.frame_analysis.frame_annotator import annotate_frame
 from pdd_no_audio.llm_tasks.step_synthesizer import synthesize_pdd_steps
 from pdd_no_audio.llm_tasks.sop_sections import (
-    generate_document_purpose,
-    generate_overview_justification,
-    generate_as_is_process,
-    generate_to_be_process,
-    generate_prerequisites,
-    generate_exception_handling,
-    generate_interface_requirements,
+    generate_all_sections_parallel,
     generate_flowchart_dot
 )
 from pdd_no_audio.pdd_document import PDDGenerator
-from pdd_no_audio.utils import detect_operations
+from pdd_no_audio.utils import detect_operations, detect_auth_screen
 
 try:
     import sys
@@ -60,6 +56,29 @@ def _compute_max_vision_calls(num_frames: int) -> int:
     target = max(base, scaled)
     target = min(target, llm_params.absolute_max_vision_calls)
     return target
+
+
+def _parallel_ocr(frame_paths: List[str], with_boxes: bool = False) -> Dict[str, Dict]:
+    """Perform OCR on multiple frames in parallel using threads."""
+    results = {}
+    if not OCR_AVAILABLE:
+        print("    [OCR] Tesseract not available, returning empty results")
+        return {fp: {"text": "", "boxes": [], "word_count": 0} for fp in frame_paths}
+
+    print(f"    [OCR] Processing {len(frame_paths)} frames in parallel...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        future_to_path = {executor.submit(ocr_frame, fp, with_boxes): fp for fp in frame_paths}
+        for future in concurrent.futures.as_completed(future_to_path):
+            path = future_to_path[future]
+            try:
+                results[path] = future.result()
+            except Exception as e:
+                print(f"    [OCR] Error on {os.path.basename(path)}: {e}")
+                results[path] = {"text": "", "boxes": [], "word_count": 0}
+
+    non_empty = sum(1 for v in results.values() if v["text"].strip())
+    print(f"    [OCR] {non_empty}/{len(frame_paths)} frames had readable text")
+    return results
 
 
 class SOPAgent:
@@ -88,14 +107,12 @@ class SOPAgent:
     def _save_flowchart_persistent(
         self, flowchart_path: str, dot_code: str, project_name: str
     ):
-        """Save flowchart PNG and DOT to persistent outputs/ directory."""
         d = path_config.output_dir
         os.makedirs(d, exist_ok=True)
         safe = "".join(
             c for c in project_name if c.isalnum() or c in (' ', '-', '_')
         ).strip()[:50] or "flowchart"
 
-        # Save PNG
         if flowchart_path and os.path.exists(flowchart_path):
             png_dest = os.path.join(d, f"{safe}_flowchart.png")
             c = 1
@@ -105,7 +122,6 @@ class SOPAgent:
             shutil.copy2(flowchart_path, png_dest)
             print(f"  📁 Flowchart PNG: {png_dest}")
 
-        # Save DOT
         if dot_code:
             dot_dest = os.path.join(d, f"{safe}_flowchart.dot")
             c = 1
@@ -141,6 +157,7 @@ class SOPAgent:
         print(f"  Vision Model: {vision_config.model}")
         print(f"  Text Model: {text_config.model}")
         print(f"  OCR: {'Available' if OCR_AVAILABLE else 'Not available'}")
+        print(f"  Parallel workers: {llm_params.text_llm_workers}")
         print("=" * 65)
 
         if not os.path.exists(video_path):
@@ -151,7 +168,6 @@ class SOPAgent:
         duration = video_info['duration']
         duration_min = duration / 60
 
-        # Compute scaled frame target
         target_frames = compute_target_frames(duration, max_frames)
 
         print(f"\n  Video: {duration:.0f}s ({duration_min:.1f}min), "
@@ -180,19 +196,37 @@ class SOPAgent:
             return None
         print(f"  ✓ {len(key_frames)} key frames ({time.time()-t:.0f}s)")
 
-        # ── PHASE 2: OCR ──
+        # ── PHASE 2: OCR (parallel) + Auth Detection ──
         print(f"\n{'='*40}")
-        print("PHASE 2/5: Reading screen text (OCR)...")
+        print("PHASE 2/5: Reading screen text (OCR) + Auth Detection...")
         print(f"{'='*40}")
         t = time.time()
 
         frame_paths = [kf["path"] for kf in key_frames]
-        ocr_results = ocr_batch(frame_paths, with_boxes=annotate)
+        # Only request boxes if annotation is enabled
+        ocr_results = _parallel_ocr(frame_paths, with_boxes=annotate)
+
+        auth_flags = []
+        auth_count = 0
         for kf in key_frames:
             ocr_data = ocr_results.get(kf["path"], {})
             kf["ocr_text"] = ocr_data.get("text", "")
             kf["ocr_boxes"] = ocr_data.get("boxes", [])
+
+            # Detect auth screens from OCR
+            auth_info = detect_auth_screen(kf["ocr_text"])
+            auth_flags.append(auth_info)
+            if auth_info["is_auth"]:
+                auth_count += 1
+
         print(f"  ✓ OCR complete ({time.time()-t:.0f}s)")
+        if auth_count > 0:
+            print(f"  🔐 Detected {auth_count} auth/login screens")
+            for i, af in enumerate(auth_flags):
+                if af["is_auth"]:
+                    print(f"    Frame {i}: {af['auth_type']} "
+                          f"(confidence={af['confidence']:.2f}, "
+                          f"indicators={af['indicators'][:5]})")
 
         # ── PHASE 3: Vision + Change Analysis ──
         print(f"\n{'='*40}")
@@ -200,11 +234,12 @@ class SOPAgent:
         print(f"{'='*40}")
         t = time.time()
 
-        # Scale vision calls with frame count
         max_vision = _compute_max_vision_calls(len(key_frames))
-        print(f"  Vision budget: {max_vision} calls for {len(key_frames)} frames")
+        # Add budget for auth screens (they always need vision)
+        max_vision += auth_count
+        print(f"  Vision budget: {max_vision} calls "
+              f"({len(key_frames)} frames, +{auth_count} auth)")
 
-        # Override llm_params for this run
         original_max = llm_params.max_vision_calls
         llm_params.max_vision_calls = max_vision
 
@@ -229,10 +264,10 @@ class SOPAgent:
             detected_operations.append(ops)
 
         transitions = analyze_transitions_smart(
-            key_frames, ocr_diffs, detected_operations, change_data
+            key_frames, ocr_diffs, detected_operations, change_data,
+            auth_flags=auth_flags
         )
 
-        # Restore original
         llm_params.max_vision_calls = original_max
 
         vision_used = sum(1 for t in transitions if t.get("used_vision"))
@@ -246,19 +281,24 @@ class SOPAgent:
         if all_ops:
             print(f"    Operations: {', '.join(sorted(all_ops))}")
 
-        # ── PHASE 4: PDD Content ──
+        # ── PHASE 4: PDD Content (parallel steps + parallel sections) ──
         print(f"\n{'='*40}")
-        print("PHASE 4/5: Generating PDD content...")
+        print("PHASE 4/5: Generating PDD content (parallel)...")
         print(f"{'='*40}")
         t = time.time()
 
-        pdd_steps = synthesize_pdd_steps(transitions, change_data)
+        # 4a. Synthesize steps (parallel)
+        pdd_steps = synthesize_pdd_steps(
+            transitions, change_data, app_name=app_name
+        )
         print(f"  ✓ {len(pdd_steps)} PDD steps")
 
         for i, s in enumerate(pdd_steps[:5]):
             ops = s.get("operations_detected", [])
+            auth = s.get("auth_info", {})
             op_str = f" [{', '.join(op['display_name'] for op in ops)}]" if ops else ""
-            print(f"    {s['number']}. {s['description'][:70]}{op_str}")
+            auth_str = f" 🔐{auth['auth_type']}" if auth.get("is_auth") else ""
+            print(f"    {s['number']}. {s['description'][:70]}{op_str}{auth_str}")
         if len(pdd_steps) > 5:
             print(f"    ... +{len(pdd_steps)-5} more")
 
@@ -268,27 +308,22 @@ class SOPAgent:
             for kf in key_frames
         ]
 
-        purpose = generate_document_purpose(project_name, app_name, step_descriptions)
-        print(f"  ✓ Purpose")
+        # 4b. Generate all sections in parallel
+        sections = generate_all_sections_parallel(
+            project_name, app_name, step_descriptions, vision_descriptions
+        )
 
-        ov_just = generate_overview_justification(project_name, app_name, step_descriptions)
-        print(f"  ✓ Overview + Justification")
+        purpose = sections.get("purpose") or ""
+        ov_just = sections.get("overview_justification") or {"overview": "", "justification": ""}
+        as_is = sections.get("as_is") or ""
+        to_be = sections.get("to_be") or ""
+        input_reqs = sections.get("prerequisites") or []
+        exceptions = sections.get("exceptions") or []
+        interfaces = sections.get("interfaces") or []
 
-        as_is = generate_as_is_process(project_name, app_name, step_descriptions)
-        print(f"  ✓ As-Is")
+        print(f"  ✓ All sections generated")
 
-        to_be = generate_to_be_process(project_name, app_name, step_descriptions)
-        print(f"  ✓ To-Be")
-
-        input_reqs = generate_prerequisites(project_name, app_name, vision_descriptions)
-        print(f"  ✓ {len(input_reqs)} inputs")
-
-        exceptions = generate_exception_handling(project_name, app_name, step_descriptions)
-        print(f"  ✓ {len(exceptions)} exceptions")
-
-        interfaces = generate_interface_requirements(app_name, vision_descriptions)
-        print(f"  ✓ {len(interfaces)} interfaces")
-
+        # 4c. Flowchart
         dot_code = generate_flowchart_dot(pdd_steps, project_name)
         flowchart_path = ""
         if dot_code and FLOWCHART_AVAILABLE:
@@ -297,10 +332,8 @@ class SOPAgent:
             if result:
                 flowchart_path = result
                 print(f"  ✓ Flowchart generated")
-                # Save to persistent outputs/
                 self._save_flowchart_persistent(flowchart_path, dot_code, project_name)
         elif dot_code:
-            # Save DOT even if renderer not available
             self._save_flowchart_persistent("", dot_code, project_name)
 
         print(f"  ✓ Phase 4 complete ({time.time()-t:.0f}s)")
@@ -337,8 +370,8 @@ class SOPAgent:
         gen.generate(
             project_name=project_name, app_name=app_name,
             document_purpose=purpose,
-            overview=ov_just.get("overview", ""),
-            justification=ov_just.get("justification", ""),
+            overview=ov_just.get("overview", "") if isinstance(ov_just, dict) else "",
+            justification=ov_just.get("justification", "") if isinstance(ov_just, dict) else "",
             as_is=as_is, to_be=to_be,
             process_steps=pdd_steps,
             input_requirements=input_reqs,
@@ -360,6 +393,8 @@ class SOPAgent:
         print(f"  Document: {persistent}")
         print(f"  Steps: {len(pdd_steps)} | Frames: {len(key_frames)}")
         print(f"  Vision calls: {vision_used} | Transitions: {len(transitions)}")
+        if auth_count > 0:
+            print(f"  Auth screens: {auth_count}")
         if all_ops:
             print(f"  Operations: {', '.join(sorted(all_ops))}")
         print(f"  Time: {total/60:.1f} minutes")

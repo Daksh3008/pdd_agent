@@ -13,6 +13,7 @@ from pdd_no_audio.llm_tasks.sop_sections import (
     generate_prerequisites,
     generate_exception_handling,
     generate_interface_requirements,
-    generate_flowchart_dot
+    generate_flowchart_dot,
+    generate_all_sections_parallel
 )
 from pdd_no_audio.llm_tasks.system_prompts import PDD_SYSTEM_PROMPT, SOP_VISION_PROMPT

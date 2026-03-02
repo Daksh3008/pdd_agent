@@ -3,14 +3,16 @@
 """
 Shared utility functions for PDD Agent (no-audio).
 Text processing, operation detection, sampling, step parsing.
+Enhanced with auth/login detection and parameter extraction.
 """
 
 import re
 import time
-from typing import List, Set, Dict
+from typing import List, Set, Dict, Optional
 
 from pdd_no_audio.config import (
-    EXCEL_OPERATIONS, WEB_OPERATIONS, GENERAL_OPERATIONS
+    EXCEL_OPERATIONS, WEB_OPERATIONS, GENERAL_OPERATIONS,
+    AUTH_VISUAL_INDICATORS
 )
 
 
@@ -102,8 +104,155 @@ def extract_application_name(vision_descriptions: List[str]) -> str:
 
 
 # ============================================================
-# Operation Detection
+# Auth/Login Screen Detection
 # ============================================================
+
+def detect_auth_screen(ocr_text: str, vision_text: str = "") -> Dict:
+    """
+    Detect if a frame shows a login/logout/auth screen.
+    Returns dict with auth_type and confidence.
+    """
+    combined = f"{ocr_text} {vision_text}".lower()
+    if not combined.strip():
+        return {"is_auth": False, "auth_type": "", "confidence": 0.0, "indicators": []}
+
+    found_indicators = []
+    for indicator in AUTH_VISUAL_INDICATORS:
+        if indicator in combined:
+            found_indicators.append(indicator)
+
+    if not found_indicators:
+        return {"is_auth": False, "auth_type": "", "confidence": 0.0, "indicators": []}
+
+    # Classify auth type
+    auth_type = "unknown_auth"
+    login_words = {"sign in", "log in", "login", "signin", "username", "password",
+                   "credentials", "welcome", "sso", "authenticate"}
+    logout_words = {"sign out", "log out", "logout", "signout", "signed out",
+                    "goodbye", "end session", "session expired"}
+    password_words = {"change password", "reset password", "forgot password",
+                      "new password", "password expired", "update password"}
+    mfa_words = {"mfa", "otp", "verification code", "two-factor", "2fa",
+                 "multi-factor", "captcha"}
+
+    login_hits = sum(1 for i in found_indicators if i in login_words or
+                     any(lw in i for lw in login_words))
+    logout_hits = sum(1 for i in found_indicators if i in logout_words or
+                      any(lw in i for lw in logout_words))
+    password_hits = sum(1 for i in found_indicators if i in password_words or
+                        any(pw in i for pw in password_words))
+    mfa_hits = sum(1 for i in found_indicators if i in mfa_words or
+                   any(mw in i for mw in mfa_words))
+
+    if logout_hits > 0 and logout_hits >= login_hits:
+        auth_type = "logout"
+    elif password_hits > 0 and password_hits >= login_hits:
+        auth_type = "password_change"
+    elif mfa_hits > 0:
+        auth_type = "mfa_verification"
+    elif login_hits > 0:
+        auth_type = "login"
+
+    # Confidence based on number of indicators
+    confidence = min(1.0, len(found_indicators) / 3.0)
+
+    # Boost confidence if multiple categories of indicators found
+    has_field = any(i in ["username", "user name", "password", "email", "user id", "userid"]
+                    for i in found_indicators)
+    has_action = any(i in ["sign in", "log in", "login", "submit", "continue",
+                           "sign out", "log out", "logout"]
+                     for i in found_indicators)
+    if has_field and has_action:
+        confidence = min(1.0, confidence + 0.3)
+
+    return {
+        "is_auth": confidence >= 0.3,
+        "auth_type": auth_type,
+        "confidence": confidence,
+        "indicators": found_indicators
+    }
+
+
+def get_auth_step_description(auth_type: str, indicators: List[str],
+                               app_name: str = "") -> str:
+    """
+    Generate a detailed auth step description for PDD.
+    Used as fallback when LLM doesn't capture auth actions.
+    """
+    app = app_name or "the application"
+
+    descriptions = {
+        "login": (
+            f"The system navigates to the login page of {app}. "
+            f"The automation enters the configured username/user ID into the "
+            f"username field and the corresponding password into the password field. "
+            f"The 'Sign In' / 'Log In' button is clicked to authenticate and "
+            f"gain access to the application. The system waits for the home page "
+            f"or dashboard to load confirming successful authentication."
+        ),
+        "logout": (
+            f"The system initiates the logout process from {app}. "
+            f"The automation clicks on the user profile menu or logout option "
+            f"and selects 'Sign Out' / 'Log Out' to end the current session. "
+            f"The system confirms the session has been terminated and the "
+            f"login page is displayed."
+        ),
+        "mfa_verification": (
+            f"The system encounters a multi-factor authentication (MFA) prompt "
+            f"in {app}. The automation handles the verification step by "
+            f"entering the OTP/verification code or completing the required "
+            f"authentication challenge. The system waits for successful "
+            f"verification before proceeding."
+        ),
+        "password_change": (
+            f"The system navigates to the password management section of {app}. "
+            f"The automation enters the current password, followed by the new "
+            f"password and confirmation. The 'Update Password' / 'Change Password' "
+            f"button is clicked and the system verifies the password change "
+            f"was successful."
+        ),
+        "unknown_auth": (
+            f"The system interacts with an authentication screen in {app}. "
+            f"The automation handles the required credential entry and "
+            f"authentication steps to proceed with the process."
+        ),
+    }
+
+    return descriptions.get(auth_type, descriptions["unknown_auth"])
+
+
+# ============================================================
+# Operation Detection with Parameter Extraction
+# ============================================================
+
+def extract_operation_parameters(text: str, operation: str) -> Dict:
+    """
+    Extract parameters for specific operations using regex.
+    Returns dict with extracted fields.
+    """
+    params = {}
+    text_lower = text.lower()
+    if operation == "vlookup":
+        match = re.search(
+            r'vlookup\s*\(\s*([^,]+)\s*,\s*([^,]+)\s*,\s*(\d+)\s*,?\s*([^)]*)\s*\)',
+            text_lower, re.IGNORECASE
+        )
+        if match:
+            params["lookup_value"] = match.group(1).strip()
+            params["table_array"] = match.group(2).strip()
+            params["col_index"] = match.group(3).strip()
+            if match.group(4):
+                params["range_lookup"] = match.group(4).strip()
+    elif operation == "filter":
+        match = re.search(
+            r'filter\s*\(\s*([^,]+)\s*,\s*([^,]+)\s*,?\s*([^)]*)\s*\)',
+            text_lower, re.IGNORECASE
+        )
+        if match:
+            params["array"] = match.group(1).strip()
+            params["include"] = match.group(2).strip()
+    return params
+
 
 def detect_operations(
     ocr_text: str,
@@ -112,7 +261,7 @@ def detect_operations(
 ) -> List[Dict]:
     """
     Detect specific operations from OCR text and vision descriptions.
-    Returns list of detected operations with category and confidence.
+    Returns list of detected operations with category, confidence, and parameters.
     """
     combined_text = f"{ocr_text} {vision_description} {change_description}".lower()
     detected = []
@@ -121,11 +270,13 @@ def detect_operations(
     for op_name, keywords in EXCEL_OPERATIONS.items():
         for kw in keywords:
             if kw in combined_text:
+                params = extract_operation_parameters(combined_text, op_name)
                 detected.append({
                     "category": "Excel",
                     "operation": op_name,
                     "keyword_matched": kw,
-                    "display_name": _format_operation_name(op_name)
+                    "display_name": _format_operation_name(op_name),
+                    "parameters": params
                 })
                 break
 
@@ -137,7 +288,8 @@ def detect_operations(
                     "category": "Web",
                     "operation": op_name,
                     "keyword_matched": kw,
-                    "display_name": _format_operation_name(op_name)
+                    "display_name": _format_operation_name(op_name),
+                    "parameters": {}
                 })
                 break
 
@@ -149,7 +301,8 @@ def detect_operations(
                     "category": "General",
                     "operation": op_name,
                     "keyword_matched": kw,
-                    "display_name": _format_operation_name(op_name)
+                    "display_name": _format_operation_name(op_name),
+                    "parameters": {}
                 })
                 break
 
@@ -179,7 +332,13 @@ def _format_operation_name(op_name: str) -> str:
         "data_validation": "Data Validation",
         "subtotal": "Subtotal/Grouping",
         "concatenate": "Text Concatenation",
-        "login": "User Authentication",
+        # Auth operations
+        "login": "User Login/Authentication",
+        "logout": "User Logout/Sign-Out",
+        "session_management": "Session Management",
+        "password_management": "Password Management",
+        "user_profile": "User Profile Access",
+        # Other web
         "navigate": "Page Navigation",
         "search": "Search/Query",
         "form_fill": "Form Data Entry",
@@ -192,7 +351,7 @@ def _format_operation_name(op_name: str) -> str:
         "table_interaction": "Table Interaction",
         "modal_dialog": "Dialog/Popup Interaction",
         "refresh": "Page Refresh",
-        "logout": "User Logout",
+        # General
         "open_application": "Application Launch",
         "close_application": "Application Close",
         "switch_window": "Window Switch",
@@ -211,6 +370,10 @@ def build_operation_context(operations: List[Dict]) -> str:
 
     lines = ["Detected operations on this screen:"]
     for op in operations:
-        lines.append(f"- {op['category']}: {op['display_name']}")
+        op_line = f"- {op['category']}: {op['display_name']}"
+        if op.get("parameters"):
+            param_str = ", ".join(f"{k}={v}" for k, v in op["parameters"].items())
+            op_line += f" ({param_str})"
+        lines.append(op_line)
 
     return "\n".join(lines)

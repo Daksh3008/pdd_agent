@@ -2,344 +2,453 @@
 
 """
 PDD document section generation using text LLM (qwen2.5:14b).
+Includes adaptive flowchart layout and parallel section generation.
 """
 
 import re
 import time
-from typing import List, Dict
+import concurrent.futures
+from typing import List, Dict, Any
 
-from pdd_no_audio.clients.text_llm import text_client
+from pdd_no_audio.clients.text_llm import TextLLMClient
+from pdd_no_audio.config import text_config, llm_params
 from pdd_no_audio.llm_tasks.system_prompts import PDD_SYSTEM_PROMPT
 from pdd_no_audio.utils import timed, safe_sample, parse_numbered_steps
 
 
+def _worker_client() -> TextLLMClient:
+    """Create a fresh TextLLMClient for parallel workers."""
+    return TextLLMClient()
+
+
+# ============================================================
+# Individual section generators
+# ============================================================
+
 def generate_document_purpose(
     project_name: str,
     app_name: str,
-    step_summaries: List[str]
+    step_summaries: List[str],
+    client: TextLLMClient = None
 ) -> str:
-    start = time.time()
-    steps_text = "\n".join([f"- {s[:120]}" for s in step_summaries[:10]])
+    if client is None:
+        from pdd_no_audio.clients.text_llm import text_client
+        client = text_client
 
-    prompt = f"""Write the "Purpose of this Document" section for a Process Definition Document (PDD).
+    steps_text = "\n".join(f"- {s[:100]}" for s in step_summaries[:15])
+
+    prompt = f"""Write a "Purpose of this Document" section for a Process Definition Document.
 
 Project: "{project_name}"
 Application: "{app_name}"
-
-The process involves these steps:
+Key Steps:
 {steps_text}
 
-Write 1-2 paragraphs covering:
-- What this document defines (objectives, scope, requirements)
-- What process is being documented for automation
-- That it covers current manual state and future automated state
-- That it serves as the basis for designing and deploying the solution
+Write 2-3 professional paragraphs explaining:
+1. What this document defines
+2. Who should use it (developers, BA, QA)
+3. Scope of the automation
 
-Use ONLY names from the information above. Formal business English. Third person.
+Do NOT use bullet points. Write in formal third person."""
 
-PURPOSE:"""
-
-    response = text_client.generate(prompt=prompt, system_prompt=PDD_SYSTEM_PROMPT, call_name="DocumentPurpose")
-    timed("Purpose", start)
-
-    if response and len(response) > 50:
-        return response.strip()
-
-    return (
-        f"This Process Definition Document (PDD) defines the objectives, scope, "
-        f"and detailed process requirements for the {project_name} automation initiative. "
-        f"It documents the current manual process performed in {app_name or 'the application'} "
-        f"and specifies the future automated state for implementation."
+    response = client.generate(
+        prompt=prompt,
+        system_prompt=PDD_SYSTEM_PROMPT,
+        temperature=0.3,
+        call_name="DocumentPurpose"
     )
+    return response.strip() if response else ""
 
 
 def generate_overview_justification(
     project_name: str,
     app_name: str,
-    step_summaries: List[str]
+    step_summaries: List[str],
+    client: TextLLMClient = None
 ) -> Dict[str, str]:
-    start = time.time()
-    steps_text = "\n".join([f"- {s[:100]}" for s in step_summaries[:8]])
+    if client is None:
+        from pdd_no_audio.clients.text_llm import text_client
+        client = text_client
 
-    prompt = f"""Write two sections for a Process Definition Document.
+    steps_text = "\n".join(f"- {s[:80]}" for s in step_summaries[:12])
+
+    prompt = f"""Write TWO sections for a PDD:
 
 Project: "{project_name}"
 Application: "{app_name}"
-
-Process steps:
+Steps:
 {steps_text}
 
-===OVERVIEW===
-Write an 'Overview and Objective' section:
-- One paragraph stating the primary objective
-- Then 4-6 bullet points of what the automation achieves
-- Use: 'Ensure...', 'Standardize...', 'Reduce...', 'Improve...'
+SECTION 1 — OVERVIEW AND OBJECTIVE:
+Write 3-5 bullet points starting with "•" describing what the automation does.
 
-===JUSTIFICATION===
-Write a 'Business Justification' section:
-- Opening sentence about operational benefits
-- Then 4-6 numbered items with **bold title** and description
+SECTION 2 — BUSINESS JUSTIFICATION:
+Write 2-3 paragraphs explaining why this process should be automated (efficiency, accuracy, compliance).
 
-Use ONLY names from above. Formal English.
+Separate the two sections clearly with headers."""
 
-===OVERVIEW==="""
-
-    response = text_client.generate(prompt=prompt, system_prompt=PDD_SYSTEM_PROMPT, call_name="OverviewJustification")
-    timed("Overview+Justification", start)
+    response = client.generate(
+        prompt=prompt,
+        system_prompt=PDD_SYSTEM_PROMPT,
+        temperature=0.3,
+        call_name="OverviewJustification"
+    )
 
     result = {"overview": "", "justification": ""}
     if response:
-        ov = re.search(r'===OVERVIEW===\s*(.*?)(?====JUSTIFICATION===|$)', response, re.DOTALL)
-        jf = re.search(r'===JUSTIFICATION===\s*(.*?)$', response, re.DOTALL)
-        if ov:
-            result["overview"] = ov.group(1).strip()
-        if jf:
-            result["justification"] = jf.group(1).strip()
+        parts = re.split(
+            r'(?:SECTION\s*2|BUSINESS\s*JUSTIFICATION|Justification)',
+            response, maxsplit=1, flags=re.IGNORECASE
+        )
+        if len(parts) >= 2:
+            result["overview"] = parts[0].strip()
+            result["justification"] = parts[1].strip()
+        else:
+            result["overview"] = response.strip()
 
-    if not result["overview"]:
-        result["overview"] = f"The primary objective is to automate the {project_name} process to ensure consistency, accuracy, and compliance."
-    if not result["justification"]:
-        result["justification"] = f"The {project_name} delivers operational efficiency and governance control."
+    for key in result:
+        result[key] = re.sub(
+            r'^(?:SECTION\s*\d|OVERVIEW|OBJECTIVE)[:\-—]*\s*',
+            '', result[key], flags=re.IGNORECASE
+        ).strip()
+
     return result
 
 
 def generate_as_is_process(
     project_name: str,
     app_name: str,
-    step_summaries: List[str]
+    step_summaries: List[str],
+    client: TextLLMClient = None
 ) -> str:
-    start = time.time()
-    steps_text = "\n".join([f"- {s[:120]}" for s in step_summaries[:10]])
+    if client is None:
+        from pdd_no_audio.clients.text_llm import text_client
+        client = text_client
 
-    prompt = f"""Document the CURRENT STATE ("As Is") for this process.
+    steps_text = "\n".join(f"- {s[:80]}" for s in step_summaries[:10])
+
+    prompt = f"""Write the "As Is" (current manual process) section for a PDD.
 
 Project: "{project_name}"
 Application: "{app_name}"
-
-Observed process steps:
+Automated Steps:
 {steps_text}
 
-Write 4-8 numbered steps. Each step:
-- **Bold title**
-- Description: what the person manually does
-- Tools Used: applications used (ONLY from the information above)
+Describe how this process is CURRENTLY done MANUALLY:
+- What manual steps does a human perform?
+- What tools do they use?
+- What are the pain points (slow, error-prone, repetitive)?
 
-Then add 'Business Challenges' with 4-6 bullet points about manual process issues.
+Write 2-3 paragraphs in formal tone."""
 
-CURRENT STATE:"""
-
-    response = text_client.generate(prompt=prompt, system_prompt=PDD_SYSTEM_PROMPT, call_name="AsIsProcess")
-    timed("As-Is", start)
-
-    if response and len(response) > 100:
-        return response.strip()
-    return f"The current {project_name} process is performed manually in {app_name or 'the application'}."
+    response = client.generate(
+        prompt=prompt,
+        system_prompt=PDD_SYSTEM_PROMPT,
+        temperature=0.3,
+        call_name="AsIsProcess"
+    )
+    return response.strip() if response else ""
 
 
 def generate_to_be_process(
     project_name: str,
     app_name: str,
-    step_summaries: List[str]
+    step_summaries: List[str],
+    client: TextLLMClient = None
 ) -> str:
-    start = time.time()
-    steps_text = "\n".join([f"- {s[:120]}" for s in step_summaries[:10]])
+    if client is None:
+        from pdd_no_audio.clients.text_llm import text_client
+        client = text_client
 
-    prompt = f"""Write the "To Be" / future automated state description.
+    steps_text = "\n".join(f"- {s[:80]}" for s in step_summaries[:10])
+
+    prompt = f"""Write the "To Be" (automated process) section for a PDD.
 
 Project: "{project_name}"
 Application: "{app_name}"
-
-Observed process steps:
+Automated Steps:
 {steps_text}
 
-Write 2-3 paragraphs describing how the automation handles this process end-to-end:
-- Write as if the automation already exists
-- Use: 'The system will...', 'The automation will automatically...'
-- Cover: trigger → connection → data handling → processing → validation → action → reporting
-- Mention specific operations (data filtering, lookups, validations) from the steps
-- End with audit readiness and compliance
+Describe the AUTOMATED process:
+- How the bot/automation executes each phase
+- What triggers the process
+- How exceptions are handled
+- What outputs are produced
 
-FUTURE STATE:"""
+Write 2-3 paragraphs in formal tone."""
 
-    response = text_client.generate(prompt=prompt, system_prompt=PDD_SYSTEM_PROMPT, call_name="ToBeProcess")
-    timed("To-Be", start)
-
-    if response and len(response) > 100:
-        return response.strip()
-    return f"The {project_name} will use an automation solution to handle the end-to-end process in {app_name or 'the application'}."
+    response = client.generate(
+        prompt=prompt,
+        system_prompt=PDD_SYSTEM_PROMPT,
+        temperature=0.3,
+        call_name="ToBeProcess"
+    )
+    return response.strip() if response else ""
 
 
 def generate_prerequisites(
     project_name: str,
     app_name: str,
-    vision_descriptions: List[str]
+    vision_descriptions: List[str],
+    client: TextLLMClient = None
 ) -> List[Dict]:
-    start = time.time()
-    screen_context = "\n".join([f"Screen {i+1}: {safe_sample(d, 200)}" for i, d in enumerate(vision_descriptions[:5])])
+    if client is None:
+        from pdd_no_audio.clients.text_llm import text_client
+        client = text_client
 
-    prompt = f"""Identify input requirements for this automation project.
+    desc_sample = "\n".join(safe_sample(d, 100) for d in vision_descriptions[:8])
+
+    prompt = f"""List the INPUT REQUIREMENTS for automating this process.
 
 Project: "{project_name}"
 Application: "{app_name}"
-
 Screens observed:
-{screen_context}
+{desc_sample}
 
-List 3-8 inputs the automation needs. Consider:
-- Credentials/access for applications
-- Source data (files, databases, portals)
-- Configuration parameters
-- File paths or network locations
+List each input as:
+1. Parameter Name | Description
+2. Parameter Name | Description
 
-FORMAT (one per line):
-INPUT: Parameter Name | DESCRIPTION: What it is and why needed
+Include: credentials, file paths, URLs, config values, email recipients, etc.
+List 5-10 inputs."""
 
-INPUTS:"""
-
-    response = text_client.generate(prompt=prompt, system_prompt=PDD_SYSTEM_PROMPT, call_name="InputRequirements")
-    timed("Inputs", start)
+    response = client.generate(
+        prompt=prompt,
+        system_prompt=PDD_SYSTEM_PROMPT,
+        temperature=0.3,
+        call_name="Prerequisites"
+    )
 
     inputs = []
     if response:
         for line in response.split('\n'):
             line = line.strip()
-            if '|' in line and 'INPUT' in line.upper():
-                parts = line.split('|')
-                param, desc = "", ""
-                for part in parts:
-                    part = part.strip()
-                    if part.upper().startswith('INPUT'):
-                        param = re.sub(r'^INPUT[S]?\s*[:]\s*', '', part, flags=re.IGNORECASE).strip()
-                    elif part.upper().startswith('DESC'):
-                        desc = re.sub(r'^DESCRIPTION\s*[:]\s*', '', part, flags=re.IGNORECASE).strip()
-                if param:
-                    inputs.append({"parameter": param, "description": desc or "Required."})
+            if '|' in line:
+                parts = line.split('|', 1)
+                param = re.sub(r'^\d+[\.\)]\s*', '', parts[0]).strip()
+                desc = parts[1].strip() if len(parts) > 1 else ""
+                if param and len(param) > 2:
+                    inputs.append({"parameter": param, "description": desc})
+            elif re.match(r'^\d+[\.\)]\s*', line) and len(line) > 10:
+                cleaned = re.sub(r'^\d+[\.\)]\s*', '', line).strip()
+                if ':' in cleaned:
+                    parts = cleaned.split(':', 1)
+                    inputs.append({
+                        "parameter": parts[0].strip(),
+                        "description": parts[1].strip()
+                    })
+                else:
+                    inputs.append({"parameter": cleaned, "description": ""})
 
-    if not inputs:
-        inputs = [
-            {"parameter": "Application Credentials", "description": f"Authorized credentials for {app_name or 'the application'}."},
-            {"parameter": "Source Data", "description": "Input data files or database access."},
-            {"parameter": "Automation Configuration", "description": "Configured workflow parameters."},
-        ]
-    return inputs
+    return inputs if inputs else [
+        {"parameter": "Application URL", "description": f"URL for {app_name or 'the application'}"},
+        {"parameter": "User Credentials", "description": "Username and password for authentication"},
+    ]
 
 
 def generate_exception_handling(
     project_name: str,
     app_name: str,
-    step_descriptions: List[str]
+    step_descriptions: List[str],
+    client: TextLLMClient = None
 ) -> List[Dict]:
-    start = time.time()
-    steps_context = "\n".join([f"- {s[:80]}" for s in step_descriptions[:10]])
+    if client is None:
+        from pdd_no_audio.clients.text_llm import text_client
+        client = text_client
 
-    prompt = f"""Write exception handling scenarios for this automation.
+    steps_sample = "\n".join(f"- {s[:80]}" for s in step_descriptions[:10])
+
+    prompt = f"""List exception handling scenarios for this automation.
 
 Project: "{project_name}"
 Application: "{app_name}"
+Steps:
+{steps_sample}
 
-Process steps:
-{steps_context}
+For each exception:
+Exception: <scenario> | Handling: <action>
 
-List 5-8 technical exception scenarios and how the system handles each.
-Consider: login failures, missing data, file not found, formula errors,
-invalid data, processing errors, application timeout, network issues.
+Include: login failures, timeouts, missing data, application errors, network issues, session expiry.
+List 6-10 exceptions."""
 
-FORMAT (one per line):
-EXCEPTION: Scenario title | HANDLING: What the system does
-
-EXCEPTIONS:"""
-
-    response = text_client.generate(prompt=prompt, system_prompt=PDD_SYSTEM_PROMPT, call_name="ExceptionHandling")
-    timed("Exceptions", start)
+    response = client.generate(
+        prompt=prompt,
+        system_prompt=PDD_SYSTEM_PROMPT,
+        temperature=0.3,
+        call_name="ExceptionHandling"
+    )
 
     exceptions = []
     if response:
         for line in response.split('\n'):
             line = line.strip()
-            if '|' in line and 'EXCEPTION' in line.upper():
-                parts = line.split('|')
-                exc = {"exception": "", "handling": ""}
-                for part in parts:
-                    part = part.strip()
-                    if part.upper().startswith('EXCEPTION'):
-                        exc["exception"] = re.sub(r'^EXCEPTION:\s*', '', part, flags=re.IGNORECASE).strip()
-                    elif part.upper().startswith('HANDLING'):
-                        exc["handling"] = re.sub(r'^HANDLING:\s*', '', part, flags=re.IGNORECASE).strip()
-                if exc["exception"]:
-                    exceptions.append(exc)
+            if '|' in line:
+                parts = line.split('|', 1)
+                exc = re.sub(
+                    r'^(?:Exception|Scenario):\s*', '',
+                    parts[0], flags=re.IGNORECASE
+                ).strip()
+                exc = re.sub(r'^\d+[\.\)]\s*', '', exc).strip()
+                handling = re.sub(
+                    r'^(?:Handling|Action):\s*', '',
+                    parts[1], flags=re.IGNORECASE
+                ).strip()
+                if exc and len(exc) > 5:
+                    exceptions.append({"exception": exc, "handling": handling})
 
-    if not exceptions:
-        exceptions = [
-            {"exception": "Application Login Failure", "handling": "Stop execution, log error, notify support."},
-            {"exception": "Source File Not Found", "handling": "Log failure, send alert, halt process."},
-            {"exception": "Invalid Data / Formula Error", "handling": "Log error details, skip affected record, continue."},
-            {"exception": "Record Not Found", "handling": "Log details, skip, continue processing."},
-            {"exception": "System Exception", "handling": "Capture details in error log for audit."},
-        ]
-    return exceptions
+    return exceptions if exceptions else [
+        {
+            "exception": "Application Login Failure",
+            "handling": "Retry login up to 3 times. If still failing, stop execution and notify support."
+        },
+        {
+            "exception": "Session Timeout / Expiry",
+            "handling": "Re-authenticate and resume from last checkpoint."
+        },
+        {
+            "exception": "Element Not Found",
+            "handling": "Wait up to 30 seconds, retry. If not found, log error and skip."
+        },
+    ]
 
 
 def generate_interface_requirements(
     app_name: str,
-    vision_descriptions: List[str]
+    vision_descriptions: List[str],
+    client: TextLLMClient = None
 ) -> List[Dict]:
-    start = time.time()
-    screen_context = "\n".join([f"Screen {i+1}: {safe_sample(d, 150)}" for i, d in enumerate(vision_descriptions[:5])])
+    if client is None:
+        from pdd_no_audio.clients.text_llm import text_client
+        client = text_client
 
-    prompt = f"""Identify application interfaces needed for this automation.
+    desc_sample = "\n".join(safe_sample(d, 80) for d in vision_descriptions[:6])
 
-Application observed: "{app_name}"
+    prompt = f"""List the INTERFACE REQUIREMENTS (applications/systems) needed for this automation.
 
-Screens observed:
-{screen_context}
+Application: "{app_name}"
+Screens:
+{desc_sample}
 
-ONLY list applications or systems visible in the screen descriptions.
+For each interface:
+1. Application/System Name | Purpose/Role in automation
 
-FORMAT (one per line):
-APP: Name | INTERFACE: Web/Desktop/API/Database | PURPOSE: Why needed
+List 3-6 interfaces."""
 
-INTERFACES:"""
+    response = client.generate(
+        prompt=prompt,
+        system_prompt=PDD_SYSTEM_PROMPT,
+        temperature=0.3,
+        call_name="InterfaceReqs"
+    )
 
-    response = text_client.generate(prompt=prompt, system_prompt=PDD_SYSTEM_PROMPT, call_name="InterfaceRequirements")
-    timed("Interfaces", start)
-
-    apps = []
+    interfaces = []
     if response:
         for line in response.split('\n'):
             line = line.strip()
-            if '|' in line and 'APP' in line.upper():
-                app = {"application": "", "interface": "", "url": "", "purpose": ""}
-                parts = line.split('|')
-                for part in parts:
-                    part = part.strip()
-                    p_up = part.upper()
-                    if p_up.startswith('APP'):
-                        app["application"] = re.sub(r'^APP(?:LICATION)?:\s*', '', part, flags=re.IGNORECASE).strip()
-                    elif p_up.startswith('INTERFACE'):
-                        app["interface"] = part.split(':', 1)[-1].strip()
-                    elif p_up.startswith('PURPOSE'):
-                        app["purpose"] = part.split(':', 1)[-1].strip()
-                if app["application"]:
-                    apps.append(app)
+            if '|' in line:
+                parts = line.split('|', 1)
+                app = re.sub(r'^\d+[\.\)]\s*', '', parts[0]).strip()
+                purpose = parts[1].strip() if len(parts) > 1 else ""
+                if app and len(app) > 2:
+                    interfaces.append({"application": app, "purpose": purpose})
 
-    if not apps and app_name:
-        apps = [{"application": app_name, "interface": "Desktop/Web", "url": "N/A", "purpose": "Primary application for process execution"}]
-    if not apps:
-        apps = [{"application": "N/A", "interface": "N/A", "url": "N/A", "purpose": "N/A"}]
-    return apps
+    return interfaces if interfaces else [
+        {
+            "application": app_name or "Target Application",
+            "purpose": "Primary application for process execution"
+        },
+    ]
 
+
+# ============================================================
+# Parallel section generation
+# ============================================================
+
+def generate_all_sections_parallel(
+    project_name: str,
+    app_name: str,
+    step_descriptions: List[str],
+    vision_descriptions: List[str]
+) -> Dict[str, Any]:
+    """
+    Generate all PDD sections in parallel using thread pool.
+    Returns dict with all section results.
+    """
+    start = time.time()
+    results = {}
+
+    def _run_purpose():
+        c = _worker_client()
+        return generate_document_purpose(project_name, app_name, step_descriptions, client=c)
+
+    def _run_overview():
+        c = _worker_client()
+        return generate_overview_justification(project_name, app_name, step_descriptions, client=c)
+
+    def _run_as_is():
+        c = _worker_client()
+        return generate_as_is_process(project_name, app_name, step_descriptions, client=c)
+
+    def _run_to_be():
+        c = _worker_client()
+        return generate_to_be_process(project_name, app_name, step_descriptions, client=c)
+
+    def _run_prereqs():
+        c = _worker_client()
+        return generate_prerequisites(project_name, app_name, vision_descriptions, client=c)
+
+    def _run_exceptions():
+        c = _worker_client()
+        return generate_exception_handling(project_name, app_name, step_descriptions, client=c)
+
+    def _run_interfaces():
+        c = _worker_client()
+        return generate_interface_requirements(app_name, vision_descriptions, client=c)
+
+    tasks = {
+        "purpose": _run_purpose,
+        "overview_justification": _run_overview,
+        "as_is": _run_as_is,
+        "to_be": _run_to_be,
+        "prerequisites": _run_prereqs,
+        "exceptions": _run_exceptions,
+        "interfaces": _run_interfaces,
+    }
+
+    workers = min(llm_params.text_llm_workers, len(tasks))
+    print(f"    [Sections] Generating {len(tasks)} sections ({workers} parallel workers)...")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_name = {executor.submit(fn): name for name, fn in tasks.items()}
+        for future in concurrent.futures.as_completed(future_to_name):
+            name = future_to_name[future]
+            try:
+                results[name] = future.result()
+                print(f"    [Sections] ✓ {name}")
+            except Exception as e:
+                print(f"    [Sections] ✗ {name}: {e}")
+                results[name] = None
+
+    timed(f"All sections ({len(results)})", start)
+    return results
+
+
+# ============================================================
+# Flowchart DOT generation
+# ============================================================
 
 def generate_flowchart_dot(
     steps: List[Dict],
     project_name: str
 ) -> str:
-    """Generate DOT flowchart code from PDD steps."""
-    start = time.time()
+    """Generate DOT flowchart code with adaptive layout based on step count."""
+    from pdd_no_audio.clients.text_llm import text_client
 
-    # For long step lists, summarize to keep prompt manageable
-    if len(steps) > 25:
-        # Take first 10, middle 5, last 10
-        mid = len(steps) // 2
+    start = time.time()
+    num_steps = len(steps)
+
+    if num_steps > 25:
+        mid = num_steps // 2
         display_steps = steps[:10] + steps[mid-2:mid+3] + steps[-10:]
     else:
         display_steps = steps[:25]
@@ -347,6 +456,16 @@ def generate_flowchart_dot(
     steps_text = "\n".join([
         f"{s['number']}. {s['description'][:80]}" for s in display_steps
     ])
+
+    if num_steps > 20:
+        rankdir = "LR"
+        size_hint = "size=\"10,8\""
+    elif num_steps > 10:
+        rankdir = "TB"
+        size_hint = "size=\"8,10\""
+    else:
+        rankdir = "TB"
+        size_hint = "size=\"8,10\""
 
     prompt = f"""Generate a Graphviz DOT flowchart for this process.
 
@@ -362,22 +481,16 @@ FLOWCHART RULES:
 4. Use node IDs like Step1, Step2, etc.
 5. Connect steps in order with arrows
 6. Use style=filled for all nodes
-7. Keep node count under 25 — group related steps if needed
+7. Layout: rankdir={rankdir}, {size_hint}
+8. For LOGIN/LOGOUT steps, use fillcolor=lightyellow and shape=diamond
 
 OUTPUT ONLY the DOT code:
 ```dot
 digraph ProcessFlow {{
-    rankdir=TB;
+    rankdir={rankdir};
+    {size_hint};
     dpi=300;
     node [fontname="Arial", fontsize=11, style=filled];
-
-    Start [label="Start", shape=oval, fillcolor=lightgreen];
-    Step1 [label="...", shape=box, fillcolor=lightblue];
-    ...
-    End [label="End", shape=oval, fillcolor=lightcoral];
-
-    Start -> Step1;
-    Step1 -> Step2;
     ...
 }}
 ```"""
@@ -393,11 +506,10 @@ digraph ProcessFlow {{
     if response:
         dot = _extract_dot(response)
         if dot:
-            # Ensure high DPI in DOT code
-            dot = _ensure_high_dpi(dot)
+            dot = _ensure_layout(dot, rankdir, size_hint, num_steps)
             return dot
 
-    return _build_simple_dot(steps, project_name)
+    return _build_simple_dot(steps, project_name, rankdir, size_hint)
 
 
 def _extract_dot(response: str) -> str:
@@ -410,31 +522,38 @@ def _extract_dot(response: str) -> str:
     return ""
 
 
-def _ensure_high_dpi(dot_code: str) -> str:
-    """Ensure DOT code has high DPI setting."""
-    if 'dpi' not in dot_code.lower():
-        # Insert dpi after opening brace
+def _ensure_layout(dot_code: str, rankdir: str, size_hint: str, num_steps: int) -> str:
+    if 'rankdir' not in dot_code:
         match = re.search(r'(digraph\s+\w*\s*\{)', dot_code)
         if match:
             insert_pos = match.end()
-            dot_code = dot_code[:insert_pos] + '\n    dpi=300;' + dot_code[insert_pos:]
-    else:
-        # Replace existing dpi with 300
-        dot_code = re.sub(r'dpi\s*=\s*\d+', 'dpi=300', dot_code)
+            dot_code = (dot_code[:insert_pos] +
+                       f'\n    rankdir={rankdir};' +
+                       dot_code[insert_pos:])
+
+    if 'size=' not in dot_code:
+        match = re.search(r'(digraph\s+\w*\s*\{)', dot_code)
+        if match:
+            insert_pos = match.end()
+            dot_code = (dot_code[:insert_pos] +
+                       f'\n    {size_hint};' +
+                       dot_code[insert_pos:])
+
     return dot_code
 
 
-def _build_simple_dot(steps: List[Dict], project_name: str) -> str:
-    # Group steps if too many
+def _build_simple_dot(steps: List[Dict], project_name: str,
+                      rankdir: str = "TB",
+                      size_hint: str = "size=\"8,10\"") -> str:
     display_steps = steps
     if len(steps) > 25:
-        # Keep first 8, middle 4, last 8
         mid = len(steps) // 2
         display_steps = steps[:8] + steps[mid-2:mid+2] + steps[-8:]
 
     lines = [
-        'digraph ProcessFlow {',
-        '    rankdir=TB;',
+        f'digraph ProcessFlow {{',
+        f'    rankdir={rankdir};',
+        f'    {size_hint};',
         '    dpi=300;',
         '    node [fontname="Arial", fontsize=11, style=filled];',
         '    edge [fontname="Arial", fontsize=9];',
@@ -443,7 +562,17 @@ def _build_simple_dot(steps: List[Dict], project_name: str) -> str:
     ]
     for i, s in enumerate(display_steps):
         label = s["description"][:40].replace('"', '\\"')
-        lines.append(f'    Step{i+1} [label="{label}", shape=box, fillcolor=lightblue];')
+        auth_info = s.get("auth_info", {})
+        if auth_info and auth_info.get("is_auth"):
+            lines.append(
+                f'    Step{i+1} [label="{label}", '
+                f'shape=diamond, fillcolor=lightyellow];'
+            )
+        else:
+            lines.append(
+                f'    Step{i+1} [label="{label}", '
+                f'shape=box, fillcolor=lightblue];'
+            )
     lines.append('    End [label="End", shape=oval, fillcolor=lightcoral];')
     lines.append('')
     lines.append('    Start -> Step1;')

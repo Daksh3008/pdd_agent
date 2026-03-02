@@ -7,7 +7,8 @@ Keeps full frame extraction for context, reduces vision calls smartly.
 """
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Tuple
 
 
 @dataclass
@@ -53,8 +54,7 @@ class FrameExtractionConfig:
     """
     Frame extraction settings.
     max_key_frames is the DEFAULT for short videos.
-    For longer videos, frames scale automatically:
-      frames = max(max_key_frames, duration_minutes * frames_per_minute)
+    For longer videos, frames scale automatically.
     """
     ssim_threshold: float = 0.85
     min_frame_gap_seconds: float = 1.5
@@ -125,6 +125,9 @@ class LLMParams:
     vision_calls_per_10_frames: int = 3
     absolute_max_vision_calls: int = 40
 
+    # Parallel workers for text LLM calls
+    text_llm_workers: int = 3
+
 
 @dataclass
 class PathConfig:
@@ -133,7 +136,7 @@ class PathConfig:
 
 
 # ============================================================
-# Known Operations
+# Known Operations — EXPANDED with auth/session actions
 # ============================================================
 
 EXCEL_OPERATIONS = {
@@ -160,7 +163,38 @@ EXCEL_OPERATIONS = {
 }
 
 WEB_OPERATIONS = {
-    "login": ["login", "sign in", "log in", "authenticate", "credentials", "username", "password"],
+    "login": [
+        "login", "log in", "sign in", "signin", "signon", "sign on",
+        "authenticate", "credentials", "username", "password",
+        "user name", "user id", "userid", "enter password",
+        "forgot password", "remember me", "keep me signed in",
+        "single sign-on", "sso", "multi-factor", "mfa", "otp",
+        "verification code", "two-factor", "2fa", "captcha",
+        "welcome back", "enter your credentials",
+    ],
+    "logout": [
+        "logout", "log out", "sign out", "signout", "sign off",
+        "logoff", "log off", "end session", "exit application",
+        "session expired", "session timeout", "you have been logged out",
+        "signed out successfully", "goodbye",
+    ],
+    "session_management": [
+        "session", "timeout", "idle", "inactivity",
+        "your session", "extend session", "session will expire",
+        "stay signed in", "keep session alive",
+        "re-authenticate", "reauthenticate",
+    ],
+    "password_management": [
+        "change password", "reset password", "forgot password",
+        "new password", "confirm password", "password expired",
+        "password policy", "password strength", "update password",
+        "current password", "old password",
+    ],
+    "user_profile": [
+        "my account", "my profile", "account settings",
+        "profile settings", "user settings", "preferences",
+        "personal information", "edit profile",
+    ],
     "navigate": ["navigate", "go to", "click on", "menu", "tab", "sidebar", "breadcrumb"],
     "search": ["search", "search bar", "query", "find", "look up"],
     "form_fill": ["fill", "enter", "type", "input", "text field", "text box", "dropdown"],
@@ -173,7 +207,6 @@ WEB_OPERATIONS = {
     "table_interaction": ["sort column", "filter table", "select row", "pagination", "next page"],
     "modal_dialog": ["popup", "modal", "dialog", "alert", "confirmation"],
     "refresh": ["refresh", "reload", "update"],
-    "logout": ["logout", "sign out", "log out"],
 }
 
 GENERAL_OPERATIONS = {
@@ -186,6 +219,23 @@ GENERAL_OPERATIONS = {
     "email": ["email", "outlook", "mail", "compose", "send email"],
     "file_operation": ["rename", "move", "delete file", "create folder", "new folder"],
 }
+
+# ============================================================
+# Auth/Login Screen Visual Indicators
+# (used by vision_describer to detect login screens visually)
+# ============================================================
+
+AUTH_VISUAL_INDICATORS = [
+    "username", "user name", "user id", "userid", "email",
+    "password", "passcode", "pin",
+    "sign in", "log in", "login", "signin",
+    "sign out", "log out", "logout", "signout",
+    "forgot", "remember me", "keep me",
+    "submit", "continue", "next",
+    "welcome", "hello", "good morning",
+    "sso", "single sign", "okta", "azure ad", "active directory",
+    "microsoft", "google sign", "office 365",
+]
 
 
 # Initialize

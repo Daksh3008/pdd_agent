@@ -3,6 +3,7 @@
 """
 Smart frame selection from detected scene changes.
 Scales frame count with video duration — longer videos get more frames.
+Enhanced with content-aware scoring.
 """
 
 import os
@@ -41,16 +42,38 @@ def compute_target_frames(video_duration_seconds: float, max_frames_override: in
     return target
 
 
+def _compute_frame_score(frame: np.ndarray, change_magnitude: float, ocr_text: str = "") -> float:
+    """
+    Compute a score for a frame based on visual richness and change magnitude.
+    Used to prioritize frames with more content.
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    # Edge density (text and UI elements)
+    edges = cv2.Canny(gray, 50, 150)
+    edge_density = np.count_nonzero(edges) / (gray.shape[0] * gray.shape[1])
+
+    # OCR text length (normalized)
+    text_score = min(len(ocr_text) / 500, 1.0) if ocr_text else 0.0
+
+    # Change magnitude (higher is better for key frames)
+    change_score = min(change_magnitude * 2, 1.0)
+
+    # Weighted combination
+    score = (edge_density * 0.3) + (text_score * 0.4) + (change_score * 0.3)
+    return score
+
+
 def select_key_frames(
     scene_changes: List[Dict],
     output_dir: str,
     max_frames: int = None,
     video_path: str = None,
-    video_duration: float = None
+    video_duration: float = None,
+    ocr_results: Dict[str, Dict] = None  # optional: OCR text per frame path
 ) -> List[Dict]:
     """
     Select and save key frames from detected scene changes.
-    Scales frame count with video duration for longer videos.
+    Uses content-aware scoring to pick the most informative frames.
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -63,9 +86,7 @@ def select_key_frames(
             video_duration = total / fps if fps > 0 else 0
             cap.release()
 
-    target_frames = compute_target_frames(
-        video_duration or 0, max_frames
-    )
+    target_frames = compute_target_frames(video_duration or 0, max_frames)
 
     if not scene_changes:
         print(f"    [Sampler] No scene changes provided")
@@ -79,23 +100,37 @@ def select_key_frames(
         f"(video: {(video_duration or 0)/60:.1f} min)"
     )
 
-    selected = scene_changes
+    # Compute scores for each scene change
+    scored = []
+    for i, sc in enumerate(scene_changes):
+        frame = sc.get("frame")
+        if frame is None:
+            continue
+        change_mag = sc.get("change_magnitude", 0.5)  # default if not present
+        # If OCR results are provided, get text for this frame (path may not match yet)
+        # We'll compute score based on frame content only for now
+        score = _compute_frame_score(frame, change_mag)
+        scored.append((score, i, sc))
 
-    # If too many, subsample evenly but keep more than before
-    if len(selected) > target_frames:
-        step = len(selected) / target_frames
-        indices = [int(i * step) for i in range(target_frames)]
-        # Always include first and last
-        if 0 not in indices:
-            indices[0] = 0
-        if len(selected) - 1 not in indices:
-            indices[-1] = len(selected) - 1
-        # Remove duplicates and sort
-        indices = sorted(set(indices))
-        selected = [selected[i] for i in indices]
-        print(f"    [Sampler] Subsampled to {len(selected)} frames")
-    else:
-        print(f"    [Sampler] Keeping all {len(selected)} detected scenes")
+    # Sort by score descending
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # Select top target_frames, but ensure first and last are included
+    selected_indices = set()
+    # Always include first and last
+    if scored:
+        selected_indices.add(0)  # first in original order
+        selected_indices.add(len(scene_changes)-1)
+
+    # Add top-scoring frames until we reach target
+    for score, idx, sc in scored:
+        if len(selected_indices) >= target_frames:
+            break
+        selected_indices.add(idx)
+
+    # Convert back to list in original order
+    selected = [scene_changes[i] for i in sorted(selected_indices)]
+    print(f"    [Sampler] Selected {len(selected)} frames based on content score")
 
     # Save frames to disk
     key_frames = []
