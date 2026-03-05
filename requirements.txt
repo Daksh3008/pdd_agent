@@ -31,3 +31,6 @@ pytesseract
 # Utilities
 tqdm>=4.66.0
 openpyxl
+
+# gemimi-client
+google-genai>=0.3.0

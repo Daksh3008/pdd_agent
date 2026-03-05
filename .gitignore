@@ -80,3 +80,4 @@ docs/_build/
 dmypy.json
 
 outputs/
+inputs/
