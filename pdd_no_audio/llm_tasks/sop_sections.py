@@ -3,6 +3,7 @@
 """
 PDD document section generation using text LLM (qwen2.5:14b).
 Includes adaptive flowchart layout and parallel section generation.
+FIXED: Improved prompts to prevent instruction leakage.
 """
 
 import re
@@ -19,6 +20,31 @@ from pdd_no_audio.utils import timed, safe_sample, parse_numbered_steps
 def _worker_client() -> TextLLMClient:
     """Create a fresh TextLLMClient for parallel workers."""
     return TextLLMClient()
+
+
+def _sanitize_section_output(text: str) -> str:
+    """Remove any instruction echoes from section outputs."""
+    if not text:
+        return ""
+    
+    # Remove common instruction patterns
+    patterns = [
+        r'^Write\s+\d+-\d+\s+.*?(?=\n|$)',
+        r'^Do\s+NOT\s+.*?(?=\n|$)',
+        r'^INSTRUCTIONS?:.*?(?=\n\n|$)',
+        r'^RULES?:.*?(?=\n\n|$)',
+        r'^OUTPUT:?\s*',
+        r'^SECTION\s*\d+[:\s]*',
+        r'(?:^|\n)Note:\s*.*?(?=\n|$)',
+    ]
+    
+    cleaned = text
+    for pattern in patterns:
+        cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE | re.MULTILINE)
+    
+    # Clean up whitespace
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    return cleaned.strip()
 
 
 # ============================================================
@@ -41,15 +67,16 @@ def generate_document_purpose(
 
 Project: "{project_name}"
 Application: "{app_name}"
-Key Steps:
+
+Key process steps:
 {steps_text}
 
-Write 2-3 professional paragraphs explaining:
-1. What this document defines
-2. Who should use it (developers, BA, QA)
-3. Scope of the automation
+Write 2-3 paragraphs explaining:
+- What this document defines
+- Who should use it (developers, business analysts, QA)
+- Scope of the automation
 
-Do NOT use bullet points. Write in formal third person."""
+Write in formal third person. Output only the section content."""
 
     response = client.generate(
         prompt=prompt,
@@ -57,7 +84,7 @@ Do NOT use bullet points. Write in formal third person."""
         temperature=0.3,
         call_name="DocumentPurpose"
     )
-    return response.strip() if response else ""
+    return _sanitize_section_output(response) if response else ""
 
 
 def generate_overview_justification(
@@ -72,20 +99,21 @@ def generate_overview_justification(
 
     steps_text = "\n".join(f"- {s[:80]}" for s in step_summaries[:12])
 
-    prompt = f"""Write TWO sections for a PDD:
+    prompt = f"""Write two sections for a PDD:
 
 Project: "{project_name}"
 Application: "{app_name}"
-Steps:
+
+Process steps:
 {steps_text}
 
-SECTION 1 — OVERVIEW AND OBJECTIVE:
-Write 3-5 bullet points starting with "•" describing what the automation does.
+=== OVERVIEW ===
+Write 3-5 bullet points (using •) describing what this automation does.
 
-SECTION 2 — BUSINESS JUSTIFICATION:
-Write 2-3 paragraphs explaining why this process should be automated (efficiency, accuracy, compliance).
+=== JUSTIFICATION ===
+Write 2-3 paragraphs explaining why this process should be automated.
 
-Separate the two sections clearly with headers."""
+Output both sections with the === headers."""
 
     response = client.generate(
         prompt=prompt,
@@ -96,21 +124,29 @@ Separate the two sections clearly with headers."""
 
     result = {"overview": "", "justification": ""}
     if response:
-        parts = re.split(
-            r'(?:SECTION\s*2|BUSINESS\s*JUSTIFICATION|Justification)',
-            response, maxsplit=1, flags=re.IGNORECASE
+        # Parse the two sections
+        overview_match = re.search(
+            r'===\s*OVERVIEW\s*===\s*(.*?)(?====\s*JUSTIFICATION|$)',
+            response, re.DOTALL | re.IGNORECASE
         )
-        if len(parts) >= 2:
-            result["overview"] = parts[0].strip()
-            result["justification"] = parts[1].strip()
-        else:
-            result["overview"] = response.strip()
-
-    for key in result:
-        result[key] = re.sub(
-            r'^(?:SECTION\s*\d|OVERVIEW|OBJECTIVE)[:\-—]*\s*',
-            '', result[key], flags=re.IGNORECASE
-        ).strip()
+        justification_match = re.search(
+            r'===\s*JUSTIFICATION\s*===\s*(.*?)$',
+            response, re.DOTALL | re.IGNORECASE
+        )
+        
+        if overview_match:
+            result["overview"] = _sanitize_section_output(overview_match.group(1))
+        if justification_match:
+            result["justification"] = _sanitize_section_output(justification_match.group(1))
+        
+        # Fallback if no markers found
+        if not result["overview"] and not result["justification"]:
+            parts = re.split(r'\n\n+', response, maxsplit=1)
+            if len(parts) >= 2:
+                result["overview"] = _sanitize_section_output(parts[0])
+                result["justification"] = _sanitize_section_output(parts[1])
+            else:
+                result["overview"] = _sanitize_section_output(response)
 
     return result
 
@@ -131,15 +167,16 @@ def generate_as_is_process(
 
 Project: "{project_name}"
 Application: "{app_name}"
-Automated Steps:
+
+The automated process includes these steps:
 {steps_text}
 
-Describe how this process is CURRENTLY done MANUALLY:
+Describe how this process is CURRENTLY done MANUALLY before automation:
 - What manual steps does a human perform?
 - What tools do they use?
-- What are the pain points (slow, error-prone, repetitive)?
+- What are the pain points?
 
-Write 2-3 paragraphs in formal tone."""
+Write 2-3 paragraphs. Output only the section content."""
 
     response = client.generate(
         prompt=prompt,
@@ -147,7 +184,7 @@ Write 2-3 paragraphs in formal tone."""
         temperature=0.3,
         call_name="AsIsProcess"
     )
-    return response.strip() if response else ""
+    return _sanitize_section_output(response) if response else ""
 
 
 def generate_to_be_process(
@@ -166,16 +203,17 @@ def generate_to_be_process(
 
 Project: "{project_name}"
 Application: "{app_name}"
-Automated Steps:
+
+Automated steps:
 {steps_text}
 
 Describe the AUTOMATED process:
-- How the bot/automation executes each phase
+- How the bot executes each phase
 - What triggers the process
 - How exceptions are handled
 - What outputs are produced
 
-Write 2-3 paragraphs in formal tone."""
+Write 2-3 paragraphs. Output only the section content."""
 
     response = client.generate(
         prompt=prompt,
@@ -183,7 +221,7 @@ Write 2-3 paragraphs in formal tone."""
         temperature=0.3,
         call_name="ToBeProcess"
     )
-    return response.strip() if response else ""
+    return _sanitize_section_output(response) if response else ""
 
 
 def generate_prerequisites(
@@ -198,19 +236,19 @@ def generate_prerequisites(
 
     desc_sample = "\n".join(safe_sample(d, 100) for d in vision_descriptions[:8])
 
-    prompt = f"""List the INPUT REQUIREMENTS for automating this process.
+    prompt = f"""List the INPUT REQUIREMENTS for this automation.
 
 Project: "{project_name}"
 Application: "{app_name}"
+
 Screens observed:
 {desc_sample}
 
-List each input as:
-1. Parameter Name | Description
-2. Parameter Name | Description
+List each input in this format:
+Parameter Name | Description
 
-Include: credentials, file paths, URLs, config values, email recipients, etc.
-List 5-10 inputs."""
+Include: credentials, file paths, URLs, config values, etc.
+List 5-10 inputs. Output only the list."""
 
     response = client.generate(
         prompt=prompt,
@@ -262,14 +300,15 @@ def generate_exception_handling(
 
 Project: "{project_name}"
 Application: "{app_name}"
-Steps:
+
+Process steps:
 {steps_sample}
 
-For each exception:
-Exception: <scenario> | Handling: <action>
+For each exception use this format:
+Exception | Handling Action
 
-Include: login failures, timeouts, missing data, application errors, network issues, session expiry.
-List 6-10 exceptions."""
+Include: login failures, timeouts, missing data, application errors.
+List 6-10 exceptions. Output only the list."""
 
     response = client.generate(
         prompt=prompt,
@@ -323,16 +362,17 @@ def generate_interface_requirements(
 
     desc_sample = "\n".join(safe_sample(d, 80) for d in vision_descriptions[:6])
 
-    prompt = f"""List the INTERFACE REQUIREMENTS (applications/systems) needed for this automation.
+    prompt = f"""List the INTERFACE REQUIREMENTS (applications/systems) for this automation.
 
 Application: "{app_name}"
-Screens:
+
+Screens observed:
 {desc_sample}
 
-For each interface:
-1. Application/System Name | Purpose/Role in automation
+For each interface use this format:
+Application Name | Purpose
 
-List 3-6 interfaces."""
+List 3-6 interfaces. Output only the list."""
 
     response = client.generate(
         prompt=prompt,
@@ -447,6 +487,7 @@ def generate_flowchart_dot(
     start = time.time()
     num_steps = len(steps)
 
+    # For large step counts, sample steps
     if num_steps > 25:
         mid = num_steps // 2
         display_steps = steps[:10] + steps[mid-2:mid+3] + steps[-10:]
@@ -457,9 +498,10 @@ def generate_flowchart_dot(
         f"{s['number']}. {s['description'][:80]}" for s in display_steps
     ])
 
+    # Determine layout based on step count
     if num_steps > 20:
         rankdir = "LR"
-        size_hint = "size=\"10,8\""
+        size_hint = "size=\"12,8\""
     elif num_steps > 10:
         rankdir = "TB"
         size_hint = "size=\"8,10\""
@@ -474,26 +516,15 @@ Process: "{project_name}"
 Steps:
 {steps_text}
 
-FLOWCHART RULES:
-1. Start with a Start node (oval, green) and end with an End node (oval, red)
-2. Every node MUST have: label="Short Description" (max 5-6 words)
-3. Steps: shape=box, fillcolor=lightblue
-4. Use node IDs like Step1, Step2, etc.
-5. Connect steps in order with arrows
-6. Use style=filled for all nodes
-7. Layout: rankdir={rankdir}, {size_hint}
-8. For LOGIN/LOGOUT steps, use fillcolor=lightyellow and shape=diamond
+Requirements:
+- Start with Start node (oval, green fill)
+- End with End node (oval, red fill)
+- Each step as a box with short label (max 6 words)
+- Use node IDs: Step1, Step2, etc.
+- Connect nodes with arrows in order
+- Layout: rankdir={rankdir}
 
-OUTPUT ONLY the DOT code:
-```dot
-digraph ProcessFlow {{
-    rankdir={rankdir};
-    {size_hint};
-    dpi=300;
-    node [fontname="Arial", fontsize=11, style=filled];
-    ...
-}}
-```"""
+Output ONLY the DOT code starting with "digraph" and ending with "}}"."""
 
     response = text_client.generate(
         prompt=prompt,
@@ -513,16 +544,22 @@ digraph ProcessFlow {{
 
 
 def _extract_dot(response: str) -> str:
+    """Extract DOT code from LLM response."""
+    # Try to find code block
     m = re.search(r'```(?:dot|graphviz|)?\s*\n?(.*?)```', response, re.DOTALL)
     if m and 'digraph' in m.group(1):
         return m.group(1).strip()
+    
+    # Try to find raw digraph
     m = re.search(r'(digraph\s+\w*\s*\{.*\})', response, re.DOTALL)
     if m:
         return m.group(1).strip()
+    
     return ""
 
 
 def _ensure_layout(dot_code: str, rankdir: str, size_hint: str, num_steps: int) -> str:
+    """Ensure DOT code has proper layout settings."""
     if 'rankdir' not in dot_code:
         match = re.search(r'(digraph\s+\w*\s*\{)', dot_code)
         if match:
@@ -545,6 +582,7 @@ def _ensure_layout(dot_code: str, rankdir: str, size_hint: str, num_steps: int) 
 def _build_simple_dot(steps: List[Dict], project_name: str,
                       rankdir: str = "TB",
                       size_hint: str = "size=\"8,10\"") -> str:
+    """Build a simple DOT flowchart as fallback."""
     display_steps = steps
     if len(steps) > 25:
         mid = len(steps) // 2
@@ -560,8 +598,10 @@ def _build_simple_dot(steps: List[Dict], project_name: str,
         '',
         '    Start [label="Start", shape=oval, fillcolor=lightgreen];'
     ]
+    
     for i, s in enumerate(display_steps):
-        label = s["description"][:40].replace('"', '\\"')
+        # Truncate label and escape quotes
+        label = s["description"][:40].replace('"', '\\"').replace('\n', ' ')
         auth_info = s.get("auth_info", {})
         if auth_info and auth_info.get("is_auth"):
             lines.append(
@@ -573,11 +613,15 @@ def _build_simple_dot(steps: List[Dict], project_name: str,
                 f'    Step{i+1} [label="{label}", '
                 f'shape=box, fillcolor=lightblue];'
             )
+    
     lines.append('    End [label="End", shape=oval, fillcolor=lightcoral];')
     lines.append('')
     lines.append('    Start -> Step1;')
+    
     for i in range(len(display_steps) - 1):
         lines.append(f'    Step{i+1} -> Step{i+2};')
+    
     lines.append(f'    Step{len(display_steps)} -> End;')
     lines.append('}')
+    
     return '\n'.join(lines)

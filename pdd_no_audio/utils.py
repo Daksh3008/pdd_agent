@@ -4,6 +4,7 @@
 Shared utility functions for PDD Agent (no-audio).
 Text processing, operation detection, sampling, step parsing.
 Enhanced with auth/login detection and parameter extraction.
+FIXED: Delta-based operation detection to prevent false positives.
 """
 
 import re
@@ -186,30 +187,25 @@ def get_auth_step_description(auth_type: str, indicators: List[str],
             f"The system navigates to the login page of {app}. "
             f"The automation enters the configured username/user ID into the "
             f"username field and the corresponding password into the password field. "
-            f"The 'Sign In' / 'Log In' button is clicked to authenticate and "
-            f"gain access to the application. The system waits for the home page "
-            f"or dashboard to load confirming successful authentication."
+            f"The 'Sign In' button is clicked to authenticate and "
+            f"gain access to the application."
         ),
         "logout": (
             f"The system initiates the logout process from {app}. "
             f"The automation clicks on the user profile menu or logout option "
-            f"and selects 'Sign Out' / 'Log Out' to end the current session. "
-            f"The system confirms the session has been terminated and the "
-            f"login page is displayed."
+            f"and selects 'Sign Out' to end the current session. "
+            f"The system confirms the session has been terminated."
         ),
         "mfa_verification": (
             f"The system encounters a multi-factor authentication (MFA) prompt "
             f"in {app}. The automation handles the verification step by "
             f"entering the OTP/verification code or completing the required "
-            f"authentication challenge. The system waits for successful "
-            f"verification before proceeding."
+            f"authentication challenge."
         ),
         "password_change": (
             f"The system navigates to the password management section of {app}. "
             f"The automation enters the current password, followed by the new "
-            f"password and confirmation. The 'Update Password' / 'Change Password' "
-            f"button is clicked and the system verifies the password change "
-            f"was successful."
+            f"password and confirmation. The password change is submitted."
         ),
         "unknown_auth": (
             f"The system interacts with an authentication screen in {app}. "
@@ -222,8 +218,155 @@ def get_auth_step_description(auth_type: str, indicators: List[str],
 
 
 # ============================================================
-# Operation Detection with Parameter Extraction
+# Operation Detection - DELTA-BASED to prevent false positives
 # ============================================================
+
+def _extract_words(text: str) -> List[str]:
+    """Extract meaningful words from text."""
+    if not text:
+        return []
+    words = re.findall(r'[a-zA-Z]{3,}', text.lower())
+    stopwords = {
+        'the', 'and', 'for', 'that', 'this', 'with', 'from',
+        'are', 'was', 'not', 'but', 'all', 'can', 'will',
+        'has', 'have', 'had', 'its', 'than', 'then', 'which',
+        'would', 'could', 'should', 'into', 'over', 'under'
+    }
+    return [w for w in words if w not in stopwords]
+
+
+def detect_operations_delta(
+    ocr_before: str,
+    ocr_after: str,
+    change_description: str = ""
+) -> List[Dict]:
+    """
+    Detect operations based on what CHANGED between frames, not what's visible.
+    This prevents false positives from static UI elements (like ribbon buttons).
+    
+    Sources for detection (in priority order):
+    1. Change description from vision model
+    2. OCR diff (words that appeared/disappeared)
+    3. NOT the full static OCR text
+    """
+    detected = []
+    
+    # Calculate OCR delta
+    words_before = set(_extract_words(ocr_before))
+    words_after = set(_extract_words(ocr_after))
+    added_words = words_after - words_before
+    removed_words = words_before - words_after
+    
+    # Combine delta + change description for search
+    delta_text = ' '.join(added_words | removed_words)
+    search_text = f"{delta_text} {change_description}".lower()
+    
+    # Also check if change description explicitly mentions an action
+    action_text = change_description.lower() if change_description else ""
+    
+    # Check Excel operations - only from delta/action
+    for op_name, keywords in EXCEL_OPERATIONS.items():
+        for kw in keywords:
+            # Check in change description (highest confidence)
+            if kw in action_text:
+                detected.append({
+                    "category": "Excel",
+                    "operation": op_name,
+                    "keyword_matched": kw,
+                    "display_name": _format_operation_name(op_name),
+                    "parameters": {},
+                    "source": "vision_action",
+                    "confidence": 0.9
+                })
+                break
+            # Check in OCR delta (medium confidence)
+            elif kw in delta_text.lower():
+                detected.append({
+                    "category": "Excel",
+                    "operation": op_name,
+                    "keyword_matched": kw,
+                    "display_name": _format_operation_name(op_name),
+                    "parameters": {},
+                    "source": "delta",
+                    "confidence": 0.7
+                })
+                break
+
+    # Check Web operations
+    for op_name, keywords in WEB_OPERATIONS.items():
+        for kw in keywords:
+            if kw in action_text:
+                detected.append({
+                    "category": "Web",
+                    "operation": op_name,
+                    "keyword_matched": kw,
+                    "display_name": _format_operation_name(op_name),
+                    "parameters": {},
+                    "source": "vision_action",
+                    "confidence": 0.9
+                })
+                break
+            elif kw in delta_text.lower():
+                detected.append({
+                    "category": "Web",
+                    "operation": op_name,
+                    "keyword_matched": kw,
+                    "display_name": _format_operation_name(op_name),
+                    "parameters": {},
+                    "source": "delta",
+                    "confidence": 0.7
+                })
+                break
+
+    # Check General operations
+    for op_name, keywords in GENERAL_OPERATIONS.items():
+        for kw in keywords:
+            if kw in action_text:
+                detected.append({
+                    "category": "General",
+                    "operation": op_name,
+                    "keyword_matched": kw,
+                    "display_name": _format_operation_name(op_name),
+                    "parameters": {},
+                    "source": "vision_action",
+                    "confidence": 0.9
+                })
+                break
+            elif kw in delta_text.lower():
+                detected.append({
+                    "category": "General",
+                    "operation": op_name,
+                    "keyword_matched": kw,
+                    "display_name": _format_operation_name(op_name),
+                    "parameters": {},
+                    "source": "delta",
+                    "confidence": 0.7
+                })
+                break
+
+    # Remove duplicates (keep highest confidence)
+    seen_ops = {}
+    for op in detected:
+        key = (op["category"], op["operation"])
+        if key not in seen_ops or op["confidence"] > seen_ops[key]["confidence"]:
+            seen_ops[key] = op
+    
+    return list(seen_ops.values())
+
+
+def detect_operations(
+    ocr_text: str,
+    vision_description: str,
+    change_description: str = ""
+) -> List[Dict]:
+    """
+    Legacy wrapper - now calls delta-based detection.
+    Kept for backwards compatibility.
+    """
+    # Split ocr_text if it looks like concatenated before+after
+    # Otherwise, use empty string for before (assume all text is "after")
+    return detect_operations_delta("", ocr_text, change_description)
+
 
 def extract_operation_parameters(text: str, operation: str) -> Dict:
     """
@@ -252,61 +395,6 @@ def extract_operation_parameters(text: str, operation: str) -> Dict:
             params["array"] = match.group(1).strip()
             params["include"] = match.group(2).strip()
     return params
-
-
-def detect_operations(
-    ocr_text: str,
-    vision_description: str,
-    change_description: str = ""
-) -> List[Dict]:
-    """
-    Detect specific operations from OCR text and vision descriptions.
-    Returns list of detected operations with category, confidence, and parameters.
-    """
-    combined_text = f"{ocr_text} {vision_description} {change_description}".lower()
-    detected = []
-
-    # Check Excel operations
-    for op_name, keywords in EXCEL_OPERATIONS.items():
-        for kw in keywords:
-            if kw in combined_text:
-                params = extract_operation_parameters(combined_text, op_name)
-                detected.append({
-                    "category": "Excel",
-                    "operation": op_name,
-                    "keyword_matched": kw,
-                    "display_name": _format_operation_name(op_name),
-                    "parameters": params
-                })
-                break
-
-    # Check Web operations
-    for op_name, keywords in WEB_OPERATIONS.items():
-        for kw in keywords:
-            if kw in combined_text:
-                detected.append({
-                    "category": "Web",
-                    "operation": op_name,
-                    "keyword_matched": kw,
-                    "display_name": _format_operation_name(op_name),
-                    "parameters": {}
-                })
-                break
-
-    # Check General operations
-    for op_name, keywords in GENERAL_OPERATIONS.items():
-        for kw in keywords:
-            if kw in combined_text:
-                detected.append({
-                    "category": "General",
-                    "operation": op_name,
-                    "keyword_matched": kw,
-                    "display_name": _format_operation_name(op_name),
-                    "parameters": {}
-                })
-                break
-
-    return detected
 
 
 def _format_operation_name(op_name: str) -> str:
@@ -368,9 +456,17 @@ def build_operation_context(operations: List[Dict]) -> str:
     if not operations:
         return ""
 
-    lines = ["Detected operations on this screen:"]
-    for op in operations:
-        op_line = f"- {op['category']}: {op['display_name']}"
+    # Only include high-confidence delta-detected operations
+    high_conf_ops = [op for op in operations 
+                     if op.get("source") in ("delta", "vision_action") 
+                     and op.get("confidence", 0) >= 0.7]
+    
+    if not high_conf_ops:
+        return ""
+
+    lines = ["Detected operations:"]
+    for op in high_conf_ops[:3]:  # Limit to top 3
+        op_line = f"- {op['display_name']}"
         if op.get("parameters"):
             param_str = ", ".join(f"{k}={v}" for k, v in op["parameters"].items())
             op_line += f" ({param_str})"

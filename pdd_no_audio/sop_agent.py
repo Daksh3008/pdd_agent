@@ -5,11 +5,13 @@ PDD Agent for Silent Screen Recordings — Main Orchestrator.
 Scales frame extraction and vision calls with video duration.
 Auth-aware: detects login/logout screens and ensures proper documentation.
 Optimized: parallel OCR, parallel step synthesis, parallel section generation.
+FIXED: Uses delta-based operation detection to prevent false positives.
 """
 
 import os
 import time
 import shutil
+import cv2
 import concurrent.futures
 from typing import Optional, Dict, List
 
@@ -35,7 +37,7 @@ from pdd_no_audio.llm_tasks.sop_sections import (
     generate_flowchart_dot
 )
 from pdd_no_audio.pdd_document import PDDGenerator
-from pdd_no_audio.utils import detect_operations, detect_auth_screen
+from pdd_no_audio.utils import detect_operations_delta, detect_auth_screen
 
 try:
     import sys
@@ -79,6 +81,86 @@ def _parallel_ocr(frame_paths: List[str], with_boxes: bool = False) -> Dict[str,
     non_empty = sum(1 for v in results.values() if v["text"].strip())
     print(f"    [OCR] {non_empty}/{len(frame_paths)} frames had readable text")
     return results
+
+
+def _extract_micro_frames(video_path: str, scene_changes: List[Dict], 
+                          output_dir: str, fps: float) -> List[Dict]:
+    """
+    Extract additional frames around each scene change to catch transient UI states.
+    This helps capture quick actions like dropdown selections, context menus, etc.
+    """
+    if not scene_changes:
+        return []
+    
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return []
+    
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = total_frames / fps if fps > 0 else 0
+    
+    enhanced_frames = []
+    existing_timestamps = set()
+    
+    # First, add all original scene change frames
+    for scene in scene_changes:
+        ts = scene.get("timestamp", 0)
+        existing_timestamps.add(round(ts, 1))
+        enhanced_frames.append(scene)
+    
+    # Now add micro-frames around each scene change
+    # Capture: 0.3s before and 0.2s after each change
+    offsets = [-0.3, 0.2]
+    
+    for i, scene in enumerate(scene_changes):
+        timestamp = scene.get("timestamp", 0)
+        
+        for offset in offsets:
+            t = timestamp + offset
+            
+            # Skip if too close to start/end
+            if t < 0.1 or t > duration - 0.1:
+                continue
+            
+            # Skip if we already have a frame very close to this time
+            if any(abs(t - et) < 0.15 for et in existing_timestamps):
+                continue
+            
+            frame_idx = int(t * fps)
+            if frame_idx < 0 or frame_idx >= total_frames:
+                continue
+            
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            
+            if ret and frame is not None:
+                minutes = int(t // 60)
+                seconds = int(t % 60)
+                millis = int((t % 1) * 100)
+                filename = f"frame_micro_{i:03d}_off{int(offset*10):+d}_{minutes}m{seconds:02d}s{millis:02d}.jpg"
+                path = os.path.join(output_dir, filename)
+                cv2.imwrite(path, frame)
+                
+                enhanced_frames.append({
+                    "path": path,
+                    "timestamp": t,
+                    "frame_index": frame_idx,
+                    "ssim_score": -1.0,  # Mark as micro-frame
+                    "parent_scene": i,
+                    "is_micro_frame": True
+                })
+                existing_timestamps.add(round(t, 1))
+    
+    cap.release()
+    
+    # Sort by timestamp
+    enhanced_frames.sort(key=lambda x: x.get("timestamp", 0))
+    
+    micro_count = sum(1 for f in enhanced_frames if f.get("is_micro_frame"))
+    if micro_count > 0:
+        print(f"    [MicroFrames] Added {micro_count} micro-frames around scene changes")
+    
+    return enhanced_frames
 
 
 class SOPAgent:
@@ -138,7 +220,8 @@ class SOPAgent:
         project_name: str,
         ssim_threshold: float = None,
         max_frames: int = None,
-        annotate: bool = None
+        annotate: bool = None,
+        enable_micro_frames: bool = True
     ) -> Optional[str]:
         t0 = time.time()
 
@@ -158,6 +241,7 @@ class SOPAgent:
         print(f"  Text Model: {text_config.model}")
         print(f"  OCR: {'Available' if OCR_AVAILABLE else 'Not available'}")
         print(f"  Parallel workers: {llm_params.text_llm_workers}")
+        print(f"  Micro-frames: {'Enabled' if enable_micro_frames else 'Disabled'}")
         print("=" * 65)
 
         if not os.path.exists(video_path):
@@ -167,17 +251,19 @@ class SOPAgent:
         video_info = get_video_info(video_path)
         duration = video_info['duration']
         duration_min = duration / 60
+        fps = video_info['fps']
 
         target_frames = compute_target_frames(duration, max_frames)
 
         print(f"\n  Video: {duration:.0f}s ({duration_min:.1f}min), "
               f"{video_info['width']}x{video_info['height']}, "
-              f"{video_info['fps']:.1f}fps")
+              f"{fps:.1f}fps")
         print(f"  Target frames: {target_frames} "
               f"({frame_config.frames_per_minute}/min × {duration_min:.1f}min)")
 
         frames_dir = os.path.join(self.output_dir, "frames")
         annotated_dir = os.path.join(self.output_dir, "annotated")
+        os.makedirs(frames_dir, exist_ok=True)
 
         # ── PHASE 1: Frame Extraction ──
         print(f"\n{'='*40}")
@@ -186,6 +272,13 @@ class SOPAgent:
         t = time.time()
 
         scene_changes = detect_scene_changes(video_path, ssim_threshold=ssim_threshold)
+        
+        # Add micro-frames if enabled
+        if enable_micro_frames and scene_changes:
+            scene_changes = _extract_micro_frames(
+                video_path, scene_changes, frames_dir, fps
+            )
+        
         key_frames = select_key_frames(
             scene_changes, output_dir=frames_dir,
             max_frames=max_frames, video_path=video_path,
@@ -203,7 +296,6 @@ class SOPAgent:
         t = time.time()
 
         frame_paths = [kf["path"] for kf in key_frames]
-        # Only request boxes if annotation is enabled
         ocr_results = _parallel_ocr(frame_paths, with_boxes=annotate)
 
         auth_flags = []
@@ -225,8 +317,7 @@ class SOPAgent:
             for i, af in enumerate(auth_flags):
                 if af["is_auth"]:
                     print(f"    Frame {i}: {af['auth_type']} "
-                          f"(confidence={af['confidence']:.2f}, "
-                          f"indicators={af['indicators'][:5]})")
+                          f"(confidence={af['confidence']:.2f})")
 
         # ── PHASE 3: Vision + Change Analysis ──
         print(f"\n{'='*40}")
@@ -235,8 +326,7 @@ class SOPAgent:
         t = time.time()
 
         max_vision = _compute_max_vision_calls(len(key_frames))
-        # Add budget for auth screens (they always need vision)
-        max_vision += auth_count
+        max_vision += auth_count  # Add budget for auth screens
         print(f"  Vision budget: {max_vision} calls "
               f"({len(key_frames)} frames, +{auth_count} auth)")
 
@@ -251,16 +341,20 @@ class SOPAgent:
 
         change_data = detect_changes_between_frames(key_frames, ocr_results)
 
+        # Use DELTA-based operation detection
         ocr_diffs = []
         detected_operations = []
         for i, cd in enumerate(change_data):
             ocr_diffs.append(cd.get("text_diff", {}))
+            
+            # Get OCR text from before and after frames
             before_kf = key_frames[i] if i < len(key_frames) else {}
             after_kf = key_frames[i + 1] if i + 1 < len(key_frames) else {}
-            ops = detect_operations(
-                f"{before_kf.get('ocr_text', '')} {after_kf.get('ocr_text', '')}",
-                "", ""
-            )
+            before_ocr = before_kf.get('ocr_text', '')
+            after_ocr = after_kf.get('ocr_text', '')
+            
+            # Use delta-based detection (not full OCR text)
+            ops = detect_operations_delta(before_ocr, after_ocr, "")
             detected_operations.append(ops)
 
         transitions = analyze_transitions_smart(
@@ -274,10 +368,12 @@ class SOPAgent:
         print(f"  ✓ Analysis complete ({time.time()-t:.0f}s)")
         print(f"    {len(transitions)} transitions, {vision_used} used vision")
 
+        # Collect unique operations (only high-confidence ones)
         all_ops = set()
         for ops_list in detected_operations:
             for op in ops_list:
-                all_ops.add(op["display_name"])
+                if op.get("confidence", 0) >= 0.7:
+                    all_ops.add(op["display_name"])
         if all_ops:
             print(f"    Operations: {', '.join(sorted(all_ops))}")
 
@@ -287,18 +383,27 @@ class SOPAgent:
         print(f"{'='*40}")
         t = time.time()
 
-        # 4a. Synthesize steps (parallel)
+        # 4a. Synthesize steps (parallel) with delta-based operations
         pdd_steps = synthesize_pdd_steps(
             transitions, change_data, app_name=app_name
         )
         print(f"  ✓ {len(pdd_steps)} PDD steps")
 
+        # Show first few steps for debugging
         for i, s in enumerate(pdd_steps[:5]):
             ops = s.get("operations_detected", [])
             auth = s.get("auth_info", {})
-            op_str = f" [{', '.join(op['display_name'] for op in ops)}]" if ops else ""
+            op_str = ""
+            if ops:
+                high_conf_ops = [op for op in ops if op.get("confidence", 0) >= 0.7]
+                if high_conf_ops:
+                    op_str = f" [{', '.join(op['display_name'] for op in high_conf_ops[:2])}]"
             auth_str = f" 🔐{auth['auth_type']}" if auth.get("is_auth") else ""
-            print(f"    {s['number']}. {s['description'][:70]}{op_str}{auth_str}")
+            # Truncate step description for display
+            desc_preview = s['description'][:70]
+            if len(s['description']) > 70:
+                desc_preview += "..."
+            print(f"    {s['number']}. {desc_preview}{op_str}{auth_str}")
         if len(pdd_steps) > 5:
             print(f"    ... +{len(pdd_steps)-5} more")
 
@@ -406,9 +511,11 @@ class SOPAgent:
 def generate_sop_from_video(
     video_path: str, project_name: str,
     output_dir: str = None, ssim_threshold: float = None,
-    max_frames: int = None, annotate: bool = None
+    max_frames: int = None, annotate: bool = None,
+    enable_micro_frames: bool = True
 ) -> Optional[str]:
     return SOPAgent(output_dir).process_video(
         video_path=video_path, project_name=project_name,
-        ssim_threshold=ssim_threshold, max_frames=max_frames, annotate=annotate
+        ssim_threshold=ssim_threshold, max_frames=max_frames, 
+        annotate=annotate, enable_micro_frames=enable_micro_frames
     )

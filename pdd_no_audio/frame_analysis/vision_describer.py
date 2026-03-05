@@ -3,7 +3,8 @@
 """
 Vision model (llama3.2-vision:11b) frame description with ROI cropping and smart prompts.
 Now combines before/after images side-by-side to work around single-image limitation.
-Enhanced: auth/login screen detection forces vision calls for auth transitions.
+Enhanced with auth/login screen detection forces vision calls for auth transitions.
+FIXED: Strict output formatting to prevent prompt leakage into document.
 """
 
 import re
@@ -21,22 +22,17 @@ from pdd_no_audio.config import llm_params
 
 VISION_SYSTEM_PROMPT = """You are a senior business analyst analyzing screenshots from a business process demonstration.
 
-RULES:
-1. Describe EXACTLY what you see — every detail matters.
-2. Identify the APPLICATION (Excel, SAP, browser, etc.).
-3. For LOGIN/AUTHENTICATION screens:
-   - Identify username/email fields, password fields, sign-in buttons.
-   - Note SSO options, MFA prompts, "Remember me" checkboxes.
-   - Describe the authentication provider (e.g., Microsoft, Okta, Google).
-   - Note any error messages or validation prompts.
-4. For LOGOUT/SIGN-OUT actions:
-   - Identify the logout button/link location (user menu, sidebar, etc.).
-   - Note confirmation dialogs or "session ended" messages.
-5. For spreadsheets: identify VLOOKUP, FILTER, SORT, PIVOT, formulas, column names, cell ranges.
-6. For web apps: identify page names, buttons, fields, menu paths.
-7. Note dialogs, popups, ribbon tabs, toolbar selections, status messages.
-8. Be SPECIFIC: mention actual text labels, column headers, button names.
-9. Do NOT mention screenshots or recordings."""
+CRITICAL RULES:
+1. Output ONLY in the exact format specified in the prompt.
+2. Do NOT include any headers like "Part 1", "Part 2", "Instructions", etc.
+3. Do NOT explain your reasoning or ask questions.
+4. Do NOT mention screenshots, recordings, frames, or demonstrations.
+5. If you cannot determine something, make your best inference and state it factually.
+6. Write in third person: "The user...", "The system...", "The screen shows..."
+7. Be SPECIFIC: mention actual text labels, column headers, button names visible on screen.
+8. For spreadsheets: identify functions (VLOOKUP, FILTER, SORT), column names, cell ranges.
+9. For web apps: identify page names, buttons, fields, menu paths.
+10. For login/auth screens: identify username fields, password fields, sign-in buttons, SSO options."""
 
 
 def _crop_to_region(image_path: str, region: Dict, padding: int = 20) -> Optional[str]:
@@ -94,114 +90,300 @@ def _combine_images_side_by_side(img1_path: str, img2_path: str, max_height: int
         return None
 
 
+def _sanitize_vision_response(text: str) -> str:
+    """Remove prompt instructions that leak into output."""
+    if not text:
+        return ""
+    
+    # Patterns that indicate prompt leakage - remove these completely
+    patterns_to_remove = [
+        # Part headers
+        r'PART\s*\d+\s*[—\-:.]?\s*[A-Z\s]*:?\s*',
+        r'Part\s*\d+\s*[—\-:.]?\s*[A-Za-z\s]*:?\s*',
+        
+        # Instruction headers
+        r'INSTRUCTIONS?:.*?(?=\n[A-Z]|\n\n|$)',
+        r'RULES?:.*?(?=\n[A-Z]|\n\n|$)',
+        r'CRITICAL RULES?:.*?(?=\n[A-Z]|\n\n|$)',
+        r'OUTPUT FORMAT:.*?(?=\n[A-Z]|\n\n|$)',
+        r'STRICT OUTPUT FORMAT.*?(?=SCREEN:|ACTION:|$)',
+        
+        # Context headers from prompt
+        r'BEFORE screen state:.*?(?=AFTER|ACTION|$)',
+        r'AFTER screen state:.*?(?=ACTION|SCREEN|$)',
+        r'Action observed:.*?(?=SCREEN|$)',
+        r'Text changes detected.*?(?=SCREEN|ACTION|$)',
+        r'Detected operations on this screen:.*?(?=SCREEN|ACTION|$)',
+        r'Change type:.*?(?=SCREEN|ACTION|$)',
+        
+        # Prompt instruction fragments
+        r'You are analyzing.*?(?=SCREEN|ACTION|The |$)',
+        r'These two screenshots.*?(?=SCREEN|ACTION|The |$)',
+        r'LEFT\s*=\s*BEFORE.*?(?=SCREEN|ACTION|$)',
+        r'RIGHT\s*=\s*AFTER.*?(?=SCREEN|ACTION|$)',
+        r'Return EXACTLY.*?(?=SCREEN|ACTION|$)',
+        r'Do NOT include.*?(?=SCREEN|ACTION|The |$)',
+        r'Do NOT explain.*?(?=SCREEN|ACTION|The |$)',
+        r'Do NOT mention.*?(?=SCREEN|ACTION|The |$)',
+        r'If you cannot.*?(?=SCREEN|ACTION|The |$)',
+        r'Write in third person.*?(?=SCREEN|ACTION|The |$)',
+        r'Be SPECIFIC.*?(?=SCREEN|ACTION|The |$)',
+        
+        # Login-specific prompt fragments
+        r'LOGIN SCREEN DETAILS:.*?(?=SCREEN|ACTION|The |$)',
+        r'LOGOUT DETAILS:.*?(?=SCREEN|ACTION|The |$)',
+        r'MFA SCREEN:.*?(?=SCREEN|ACTION|The |$)',
+        r'PASSWORD SCREEN:.*?(?=SCREEN|ACTION|The |$)',
+        r'ACTION PERFORMED:.*?(?=SCREEN|ACTION|The |$)',
+        
+        # Question fragments (model asking for info)
+        r'[Pp]lease provide.*',
+        r'I need more information.*',
+        r'[Cc]ould you (please )?provide.*',
+        r'I cannot determine.*',
+        r'[Bb]ased on the provided information,?\s*(it seems|I|the).*',
+        r'I would need.*',
+        r'To accurately.*',
+        r'Without more context.*',
+        
+        # Bullet points from instructions
+        r'^[\s]*[•\-\*]\s+(?:What|Is there|Are there|Note|Describe|Was|Did|How).*$',
+        
+        # Section dividers
+        r'^[\s]*[-=]{3,}[\s]*$',
+    ]
+    
+    cleaned = text
+    for pattern in patterns_to_remove:
+        cleaned = re.sub(pattern, '', cleaned, flags=re.DOTALL | re.IGNORECASE | re.MULTILINE)
+    
+    # Remove multiple newlines and clean whitespace
+    cleaned = re.sub(r'\n\s*\n+', '\n', cleaned)
+    cleaned = re.sub(r'[ \t]+', ' ', cleaned)
+    
+    # Remove empty lines at start/end
+    lines = [line.strip() for line in cleaned.split('\n') if line.strip()]
+    cleaned = '\n'.join(lines)
+    
+    return cleaned.strip()
+
+
+def _extract_screen_action(response: str) -> Dict[str, str]:
+    """
+    Extract SCREEN and ACTION sections from vision response.
+    Uses multiple parsing strategies with strict fallbacks.
+    """
+    result = {"screen_description": "", "action_description": ""}
+    
+    if not response:
+        return result
+    
+    # First, sanitize the response to remove prompt leakage
+    cleaned = _sanitize_vision_response(response)
+    
+    # Strategy 1: Look for explicit SCREEN: and ACTION: markers
+    screen_match = re.search(
+        r'SCREEN:\s*(.*?)(?=ACTION:|$)', 
+        cleaned, 
+        re.DOTALL | re.IGNORECASE
+    )
+    action_match = re.search(
+        r'ACTION:\s*(.*?)$', 
+        cleaned, 
+        re.DOTALL | re.IGNORECASE
+    )
+    
+    if screen_match and action_match:
+        screen_text = screen_match.group(1).strip()
+        action_text = action_match.group(1).strip()
+        
+        # Validate that these aren't just more instructions
+        if len(screen_text) > 10 and not _is_instruction_text(screen_text):
+            result["screen_description"] = screen_text
+        if len(action_text) > 10 and not _is_instruction_text(action_text):
+            result["action_description"] = action_text
+    
+    # Strategy 2: If we got ACTION but not SCREEN, use the first part as screen
+    if result["action_description"] and not result["screen_description"]:
+        # Take text before ACTION: as screen description
+        before_action = re.split(r'ACTION:', cleaned, flags=re.IGNORECASE)[0].strip()
+        if len(before_action) > 20 and not _is_instruction_text(before_action):
+            result["screen_description"] = before_action
+    
+    # Strategy 3: If still nothing, try to extract any useful content
+    if not result["screen_description"] and not result["action_description"]:
+        # Look for sentences that start with "The user", "The system", "The screen"
+        sentences = re.split(r'(?<=[.!?])\s+', cleaned)
+        action_sentences = []
+        screen_sentences = []
+        
+        for sent in sentences:
+            sent = sent.strip()
+            if not sent or len(sent) < 15:
+                continue
+            if _is_instruction_text(sent):
+                continue
+            
+            lower = sent.lower()
+            if any(lower.startswith(p) for p in ['the user ', 'user ', 'clicked ', 'selected ', 'entered ']):
+                action_sentences.append(sent)
+            elif any(lower.startswith(p) for p in ['the screen ', 'the page ', 'the application ', 'this is ', 'showing ']):
+                screen_sentences.append(sent)
+            else:
+                # Could be either - add to screen if no action yet
+                if not action_sentences:
+                    screen_sentences.append(sent)
+                else:
+                    action_sentences.append(sent)
+        
+        if screen_sentences:
+            result["screen_description"] = ' '.join(screen_sentences[:3])
+        if action_sentences:
+            result["action_description"] = ' '.join(action_sentences[:2])
+    
+    # Strategy 4: Ultimate fallback - use sanitized text as action
+    if not result["action_description"]:
+        if cleaned and len(cleaned) > 20 and not _is_instruction_text(cleaned):
+            # Take first 200 chars as a generic action description
+            result["action_description"] = cleaned[:200].strip()
+            if not result["action_description"].endswith('.'):
+                result["action_description"] += "."
+    
+    # Final validation and cleanup
+    for key in result:
+        if result[key]:
+            result[key] = _final_cleanup(result[key])
+    
+    return result
+
+
+def _is_instruction_text(text: str) -> bool:
+    """Check if text appears to be instruction/prompt content rather than actual description."""
+    if not text:
+        return True
+    
+    lower = text.lower()
+    
+    instruction_indicators = [
+        'instructions:', 'rules:', 'do not', "don't", 'must be', 'should be',
+        'please provide', 'i need', 'could you', 'would you',
+        'return exactly', 'output format', 'strict format',
+        'part 1', 'part 2', 'part 3',
+        'before screen', 'after screen', 'left =', 'right =',
+        'you are analyzing', 'these two screenshots',
+        'what application', 'is there a', 'are there any',
+        'describe in detail', 'note any', 'identify the',
+        'for excel', 'for web apps', 'for login',
+        'if this is', 'if unclear',
+    ]
+    
+    return any(indicator in lower for indicator in instruction_indicators)
+
+
+def _final_cleanup(text: str) -> str:
+    """Final cleanup of extracted text."""
+    if not text:
+        return ""
+    
+    # Remove any remaining SCREEN:/ACTION: prefixes
+    text = re.sub(r'^(SCREEN|ACTION):\s*', '', text, flags=re.IGNORECASE)
+    
+    # Remove numbered list prefixes that look like instructions
+    text = re.sub(r'^\d+[\.\)]\s*', '', text)
+    
+    # Remove leading/trailing whitespace and normalize spaces
+    text = ' '.join(text.split())
+    
+    # Ensure it doesn't start with lowercase (except for known words)
+    if text and text[0].islower() and not text.startswith(('the ', 'a ', 'an ')):
+        text = text[0].upper() + text[1:]
+    
+    return text.strip()
+
+
 def _select_prompt(change_type: str, operation_category: str = None,
                    auth_info: Dict = None) -> str:
     """
     Select appropriate prompt template based on change type, operation, and auth detection.
+    FIXED: Uses strict SCREEN:/ACTION: format to enable reliable parsing.
     """
+    
+    # Base format instruction - ALWAYS required
+    format_instruction = """
+OUTPUT EXACTLY IN THIS FORMAT (no other text):
+
+SCREEN:
+[2-4 sentences describing the RIGHT screenshot - application name, current page/tab, visible data, fields, buttons]
+
+ACTION:
+[1-2 sentences describing exactly what the user did to go from LEFT to RIGHT screenshot]
+"""
+
     # AUTH-SPECIFIC PROMPTS
     if auth_info and auth_info.get("is_auth"):
         auth_type = auth_info.get("auth_type", "login")
 
         if auth_type == "login":
-            return """These two screenshots are shown side-by-side: LEFT = BEFORE, RIGHT = AFTER.
+            return f"""Two screenshots side-by-side: LEFT = BEFORE, RIGHT = AFTER (login/sign-in screen).
+{format_instruction}
 
-This appears to be a LOGIN / SIGN-IN screen. Describe in detail:
-
-PART 1 — LOGIN SCREEN DETAILS:
-- What application login page is shown?
-- Is there a username/email field? What placeholder text or labels are visible?
-- Is there a password field?
-- What is the sign-in / login button text?
-- Are there SSO options (e.g., "Sign in with Microsoft", "Sign in with Google")?
-- Is there a "Remember me" or "Keep me signed in" checkbox?
-- Is there a "Forgot password?" link?
-- Any MFA/2FA prompts or verification steps?
-- Any error messages or validation messages visible?
-
-PART 2 — ACTION PERFORMED:
-- Did the user enter credentials and click Sign In?
-- Did the user use SSO?
-- Was authentication successful (did the screen change to a dashboard/home page)?
-- Describe the exact authentication flow observed."""
+Focus on: login page details, username/email field, password field, sign-in button text, SSO options, any error messages."""
 
         elif auth_type == "logout":
-            return """These two screenshots are shown side-by-side: LEFT = BEFORE, RIGHT = AFTER.
+            return f"""Two screenshots side-by-side: LEFT = BEFORE, RIGHT = AFTER (logout/sign-out action).
+{format_instruction}
 
-This appears to be a LOGOUT / SIGN-OUT action. Describe in detail:
-
-PART 1 — LOGOUT DETAILS:
-- Where was the logout option located (user menu, sidebar, header)?
-- What was the exact text of the logout button/link?
-- Was there a confirmation dialog?
-- What page appeared after logout (login page, goodbye message)?
-
-PART 2 — ACTION PERFORMED:
-- How did the user initiate the logout?
-- Was the session ended successfully?
-- Describe the exact logout flow observed."""
+Focus on: where logout option was located, confirmation dialogs, resulting page after logout."""
 
         elif auth_type == "mfa_verification":
-            return """These two screenshots are shown side-by-side: LEFT = BEFORE, RIGHT = AFTER.
+            return f"""Two screenshots side-by-side: LEFT = BEFORE, RIGHT = AFTER (MFA/verification step).
+{format_instruction}
 
-This appears to be a MULTI-FACTOR AUTHENTICATION (MFA) step. Describe in detail:
-
-PART 1 — MFA SCREEN:
-- What type of verification is required (OTP, push notification, email code, authenticator app)?
-- What input field is shown?
-- What instructions are displayed?
-
-PART 2 — ACTION PERFORMED:
-- How did the user complete the verification?
-- Was verification successful?"""
+Focus on: type of verification (OTP, push, email code), input fields, verification outcome."""
 
         elif auth_type == "password_change":
-            return """These two screenshots are shown side-by-side: LEFT = BEFORE, RIGHT = AFTER.
+            return f"""Two screenshots side-by-side: LEFT = BEFORE, RIGHT = AFTER (password change screen).
+{format_instruction}
 
-This appears to be a PASSWORD CHANGE/RESET screen. Describe in detail:
+Focus on: password fields visible, requirements shown, submit button, success/error messages."""
 
-PART 1 — PASSWORD SCREEN:
-- What fields are visible (current password, new password, confirm password)?
-- What password requirements/policy is shown?
-- What is the submit button text?
-
-PART 2 — ACTION PERFORMED:
-- Did the user change their password?
-- Was the change successful?"""
-
-    # STANDARD PROMPTS (unchanged logic)
-    base_prompt = """These two screenshots are shown side-by-side: LEFT = BEFORE, RIGHT = AFTER. The user performed an action between them.
-
-PART 1 — AFTER SCREEN: Describe the RIGHT screenshot (the state after the action) in detail:
-- What application is shown?
-- What page/tab/sheet is active?
-- What data, columns, fields, buttons are visible?
-- Any formula bar content, dialogs, menus, ribbon selections?
-
-PART 2 — ACTION PERFORMED: What EXACT action did the user perform?"""
-
+    # OPERATION-SPECIFIC PROMPTS
     if operation_category == "Excel":
-        return base_prompt + """
-- For Excel: Was it VLOOKUP, FILTER, SORT, DUPLICATE REMOVAL, a formula, copy/paste?
-  Which columns, cells, or ranges were involved?
-- What menu item or toolbar option was used?
-- Provide the exact formula if visible."""
+        return f"""Two screenshots side-by-side: LEFT = BEFORE, RIGHT = AFTER (Excel/spreadsheet operation).
+{format_instruction}
+
+Focus on: Excel function used (VLOOKUP, FILTER, SORT, etc.), specific columns/cells involved, formula bar content, any dialogs or ribbon selections."""
+
     elif operation_category == "Web":
-        return base_prompt + """
-- For web apps: What button was clicked? What field was filled? What was selected?
-- Was this a login, logout, or authentication action?
-- What menu item or toolbar option was used?
-- Provide the exact navigation path."""
+        return f"""Two screenshots side-by-side: LEFT = BEFORE, RIGHT = AFTER (web application).
+{format_instruction}
+
+Focus on: page/section name, button clicked, field filled, menu selection, form submission."""
+
+    # CHANGE-TYPE SPECIFIC PROMPTS
+    if change_type == "page_transition":
+        return f"""Two screenshots side-by-side: LEFT = BEFORE, RIGHT = AFTER (page navigation).
+{format_instruction}
+
+Focus on: what page/screen the user navigated from and to, navigation method used."""
+
     elif change_type == "modal_popup":
-        return base_prompt + """
-- What dialog or popup appeared?
-- What options were presented?
-- What action did the user take?"""
-    else:
-        return base_prompt + """
-- What exactly changed between the two screens?
-- Was this a login, logout, navigation, or data entry action?
-- Describe the user's action in one detailed sentence starting with "The user..."."""
+        return f"""Two screenshots side-by-side: LEFT = BEFORE, RIGHT = AFTER (dialog/popup appeared).
+{format_instruction}
+
+Focus on: dialog title, options presented, what triggered the dialog, what action user took."""
+
+    elif change_type == "form_input":
+        return f"""Two screenshots side-by-side: LEFT = BEFORE, RIGHT = AFTER (form/data entry).
+{format_instruction}
+
+Focus on: which field was filled, what data was entered, any validation messages."""
+
+    # DEFAULT PROMPT
+    return f"""Two screenshots side-by-side: LEFT = BEFORE, RIGHT = AFTER.
+{format_instruction}
+
+Describe what application is shown and what specific action the user performed."""
 
 
 def describe_transition(
@@ -218,6 +400,7 @@ def describe_transition(
     """
     Describe transition with optional ROI cropping and smart prompts.
     Auth-aware: uses specialized prompts for login/logout screens.
+    FIXED: Uses strict parsing to prevent prompt leakage.
     """
     before_img = frame_before_path
     after_img = frame_after_path
@@ -236,12 +419,14 @@ def describe_transition(
     if combined_path is None:
         combined_path = before_img
 
+    # Get the appropriate prompt
     prompt = _select_prompt(change_type, operation_category, auth_info)
 
+    # Add context hints (but keep them minimal to avoid leakage)
     if ocr_diff_summary:
-        prompt += f"\nText changes detected between screens:\n{ocr_diff_summary}"
-    if operation_context:
-        prompt += f"\n{operation_context}"
+        # Truncate and simplify OCR context
+        ocr_hint = ocr_diff_summary[:200] if len(ocr_diff_summary) > 200 else ocr_diff_summary
+        prompt += f"\n\nContext hint: {ocr_hint}"
 
     response = vision_client.generate(
         prompt=prompt,
@@ -265,20 +450,18 @@ def describe_transition(
         except:
             pass
 
-    result = {"screen_description": "", "action_description": ""}
-    if response:
-        cleaned = clean_vision_response(response)
-        screen_match = re.search(r'SCREEN:\s*(.*?)(?=ACTION:|$)', cleaned, re.DOTALL | re.IGNORECASE)
-        action_match = re.search(r'ACTION:\s*(.*?)$', cleaned, re.DOTALL | re.IGNORECASE)
-        if screen_match:
-            result["screen_description"] = screen_match.group(1).strip()
-        if action_match:
-            result["action_description"] = action_match.group(1).strip()
-        if not result["screen_description"] and not result["action_description"]:
-            result["screen_description"] = cleaned
-            result["action_description"] = cleaned
-    else:
-        print(f"    [Vision] No response for transition {call_index} after retries")
+    # Parse response with strict extraction
+    result = _extract_screen_action(response)
+    
+    # Log parsing result for debugging
+    if not result["action_description"]:
+        print(f"    [Vision] Warning: No action extracted for transition {call_index}")
+        # Ultimate fallback
+        result["action_description"] = "The user performed an action on the screen."
+    
+    if not result["screen_description"]:
+        result["screen_description"] = "Screen state changed."
+    
     return result
 
 
@@ -420,9 +603,9 @@ def analyze_transitions_smart(
             added = diff.get("added_words", [])[:15]
             removed = diff.get("removed_words", [])[:15]
             if added:
-                ocr_summary += f"New text appeared: {', '.join(added)}\n"
+                ocr_summary += f"New text: {', '.join(added)}\n"
             if removed:
-                ocr_summary += f"Text disappeared: {', '.join(removed)}\n"
+                ocr_summary += f"Removed text: {', '.join(removed)}\n"
 
         op_context = ""
         operation_category = None
@@ -554,26 +737,24 @@ def _build_rich_ocr_description(
     removed = ocr_diff.get("removed_words", [])
 
     if added:
-        parts.append(f"New text visible on screen: {', '.join(added[:15])}")
+        parts.append(f"New text visible: {', '.join(added[:15])}")
     if removed:
-        parts.append(f"Previous text no longer visible: {', '.join(removed[:10])}")
+        parts.append(f"Previous text removed: {', '.join(removed[:10])}")
 
-    # Operations
+    # Operations (only if detected from delta, not static presence)
     if operations:
-        op_names = [op["display_name"] for op in operations]
-        parts.append(f"Detected operations: {', '.join(op_names)}")
+        # Filter to only delta-detected operations
+        delta_ops = [op for op in operations if op.get("source") == "delta"]
+        if delta_ops:
+            op_names = [op["display_name"] for op in delta_ops]
+            parts.append(f"Operations detected: {', '.join(op_names)}")
 
     # Pixel change magnitude
     magnitude = change_info.get("pixel_change_magnitude", 0)
     if magnitude > 0.5:
-        parts.append("Major visual change — likely a page or application switch.")
+        parts.append("Major visual change occurred.")
     elif magnitude > 0.2:
-        parts.append("Significant screen change — new section or large update.")
-    elif magnitude > 0.05:
-        parts.append("Moderate screen change — specific area updated.")
-
-    if ocr_after and len(ocr_after) > 20:
-        parts.append(f"Current screen text includes: {ocr_after[:300]}")
+        parts.append("Significant screen update occurred.")
 
     if parts:
         return " ".join(parts)
@@ -583,9 +764,12 @@ def _build_rich_ocr_description(
 
 def identify_application(frame_path: str) -> str:
     """Identify the application shown in a frame."""
-    prompt = """What application, website, or software tool is shown?
-Reply with ONLY the application name. Nothing else.
-Examples: "Microsoft Excel", "Google Chrome - Salesforce", "SAP GUI"."""
+    prompt = """What application, website, or software tool is shown in this screenshot?
+
+OUTPUT EXACTLY IN THIS FORMAT:
+APPLICATION: [application name only, e.g., "Microsoft Excel", "Google Chrome - Salesforce", "SAP GUI"]
+
+Do not include any other text."""
 
     response = vision_client.generate(
         prompt=prompt,
@@ -594,9 +778,20 @@ Examples: "Microsoft Excel", "Google Chrome - Salesforce", "SAP GUI"."""
     )
 
     if response:
-        name = response.strip().strip('"\'').split('\n')[0].strip()
+        # Extract application name
+        match = re.search(r'APPLICATION:\s*(.+)', response, re.IGNORECASE)
+        if match:
+            name = match.group(1).strip().strip('"\'')
+            if len(name) > 2 and len(name) < 50:
+                return name
+        
+        # Fallback: try to get first line if no marker
+        name = response.strip().split('\n')[0].strip().strip('"\'')
+        # Remove any "APPLICATION:" prefix if present
+        name = re.sub(r'^APPLICATION:\s*', '', name, flags=re.IGNORECASE)
         if len(name) > 2 and len(name) < 50:
             return name
+    
     return ""
 
 
