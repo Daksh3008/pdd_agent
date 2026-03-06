@@ -9,7 +9,7 @@ Includes parallel generation for video pipeline sections.
 import re
 import time
 import concurrent.futures
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
 from core.gemini_client import gemini_client
 from core.config import config
@@ -51,10 +51,105 @@ _VIDEO_SECTION_PROMPT_BASE = f"""You are a senior Business Analyst creating a Pr
 CRITICAL: Output ONLY the requested section content. No headers, no instructions, no meta-commentary."""
 
 
+def _format_clarification_context(clarification_qa: Optional[Dict[str, str]]) -> str:
+    """Format user-provided Q/A clarifications for section prompts."""
+    if not clarification_qa:
+        return ""
+
+    lines = []
+    for i, (question, answer) in enumerate(clarification_qa.items(), start=1):
+        q = redact_pii_text((question or "").strip())
+        a = redact_pii_text((answer or "").strip())
+        if q and a:
+            lines.append(f"{i}. Q: {q}\n   A: {a}")
+
+    if not lines:
+        return ""
+
+    return (
+        "Human Clarifications (authoritative context):\n"
+        + "\n".join(lines)
+        + "\nUse this context whenever relevant to remove ambiguity.\n"
+    )
+
+
+def generate_section_clarification_questions(
+    project_name: str,
+    app_name: str,
+    step_descriptions: List[str],
+    vision_descriptions: List[str],
+    max_questions: int = 5
+) -> List[str]:
+    """Generate clarifying questions before section generation."""
+    steps_text = "\n".join(f"- {s[:120]}" for s in step_descriptions[:15])
+    vision_text = "\n".join(f"- {safe_sample(v, 120)}" for v in vision_descriptions[:8])
+
+    prompt = f"""You are preparing to draft a high-quality Process Definition Document.
+
+Project: "{project_name}"
+Application: "{app_name}"
+
+Observed process steps:
+{steps_text}
+
+Observed screen/context notes:
+{vision_text}
+
+TASK:
+Ask the minimum clarifying questions needed to improve document quality.
+
+RULES:
+- Ask at most {max_questions} questions.
+- Ask only if the answer materially improves Purpose, As-Is, To-Be, requirements, exceptions, or interfaces.
+- Keep each question specific and answerable in 1-3 sentences.
+- Output only questions, one per line.
+- Do not include numbering, headings, or explanations."""
+
+    response = gemini_client.generate(
+        prompt=prompt,
+        system_prompt=_VIDEO_SECTION_PROMPT_BASE,
+        temperature=0.2,
+        call_name="SectionClarificationQuestions_Video"
+    )
+
+    fallback_questions = [
+        "What is the exact trigger that starts this automation?",
+        "What inputs must be available before execution begins?",
+        "What should the system do when validation fails or data is missing?",
+    ]
+
+    if not response:
+        return fallback_questions[:max_questions]
+
+    questions = []
+    for line in response.split("\n"):
+        q = re.sub(r"^\s*(?:\d+[\.)]\s*|[-*]\s*)", "", line).strip()
+        q = re.sub(r'^"|"$', "", q).strip()
+        if not q or len(q) <= 8:
+            continue
+        if "?" not in q:
+            q = q.rstrip(".:") + "?"
+        questions.append(q)
+
+    deduped = []
+    seen = set()
+    for q in questions:
+        key = q.lower()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(q)
+
+    if not deduped:
+        return fallback_questions[:max_questions]
+
+    return deduped[:max_questions]
+
+
 def _generate_purpose_video(
     project_name: str,
     app_name: str,
-    step_summaries: List[str]
+    step_summaries: List[str],
+    clarification_context: str = ""
 ) -> str:
     """Generate purpose section from video step summaries."""
     steps_text = "\n".join(f"- {s[:100]}" for s in step_summaries[:15])
@@ -66,6 +161,8 @@ Application: "{app_name}"
 
 Key process steps observed:
 {steps_text}
+
+{clarification_context}
 
 REQUIREMENTS:
 - Write 2-3 substantive paragraphs (150-250 words total).
@@ -89,7 +186,8 @@ Output ONLY the section content."""
 def _generate_overview_video(
     project_name: str,
     app_name: str,
-    step_summaries: List[str]
+    step_summaries: List[str],
+    clarification_context: str = ""
 ) -> Dict[str, str]:
     """Generate overview and justification from video step summaries."""
     steps_text = "\n".join(f"- {s[:80]}" for s in step_summaries[:12])
@@ -101,6 +199,8 @@ Application: "{app_name}"
 
 Process steps observed:
 {steps_text}
+
+{clarification_context}
 
 === OVERVIEW ===
 Write 1 opening paragraph stating the primary business objective of this automation.
@@ -142,7 +242,8 @@ Output both sections with the === headers. Third person, present tense, active v
 def _generate_as_is_video(
     project_name: str,
     app_name: str,
-    step_summaries: List[str]
+    step_summaries: List[str],
+    clarification_context: str = ""
 ) -> str:
     """Generate as-is section from video step summaries."""
     steps_text = "\n".join(f"- {s[:80]}" for s in step_summaries[:10])
@@ -154,6 +255,8 @@ Application: "{app_name}"
 
 The automated process includes these steps:
 {steps_text}
+
+{clarification_context}
 
 YOUR TASK:
 Describe how this process is CURRENTLY performed MANUALLY before automation.
@@ -180,7 +283,8 @@ Output ONLY the section content."""
 def _generate_to_be_video(
     project_name: str,
     app_name: str,
-    step_summaries: List[str]
+    step_summaries: List[str],
+    clarification_context: str = ""
 ) -> str:
     """Generate to-be section from video step summaries."""
     steps_text = "\n".join(f"- {s[:80]}" for s in step_summaries[:10])
@@ -192,6 +296,8 @@ Application: "{app_name}"
 
 Automated steps:
 {steps_text}
+
+{clarification_context}
 
 YOUR TASK:
 Describe the AUTOMATED process as if it is already operational.
@@ -219,7 +325,8 @@ Output ONLY the section content."""
 def _generate_prerequisites_video(
     project_name: str,
     app_name: str,
-    vision_descriptions: List[str]
+    vision_descriptions: List[str],
+    clarification_context: str = ""
 ) -> List[Dict]:
     """Generate prerequisites/inputs from video analysis."""
     desc_sample = "\n".join(safe_sample(d, 100) for d in vision_descriptions[:8])
@@ -231,6 +338,8 @@ Application: "{app_name}"
 
 Screens observed:
 {desc_sample}
+
+{clarification_context}
 
 YOUR TASK:
 List each input parameter the automation requires to execute.
@@ -273,7 +382,8 @@ NEVER include actual credential values, personal names, or email addresses."""
 def _generate_exceptions_video(
     project_name: str,
     app_name: str,
-    step_descriptions: List[str]
+    step_descriptions: List[str],
+    clarification_context: str = ""
 ) -> List[Dict]:
     """Generate exception handling from video analysis."""
     steps_sample = "\n".join(f"- {s[:80]}" for s in step_descriptions[:10])
@@ -285,6 +395,8 @@ Application: "{app_name}"
 
 Process steps:
 {steps_sample}
+
+{clarification_context}
 
 YOUR TASK:
 For each potential failure scenario, describe the exception and the system's handling action.
@@ -326,7 +438,8 @@ Write handling actions in third person: "The system retries...", "The system log
 
 def _generate_interfaces_video(
     app_name: str,
-    vision_descriptions: List[str]
+    vision_descriptions: List[str],
+    clarification_context: str = ""
 ) -> List[Dict]:
     """Generate interface requirements from video analysis."""
     desc_sample = "\n".join(safe_sample(d, 80) for d in vision_descriptions[:6])
@@ -337,6 +450,8 @@ Application: "{app_name}"
 
 Screens observed:
 {desc_sample}
+
+{clarification_context}
 
 YOUR TASK:
 List each application or system the automation interacts with and its purpose.
@@ -375,7 +490,8 @@ def generate_all_sections_parallel(
     project_name: str,
     app_name: str,
     step_descriptions: List[str],
-    vision_descriptions: List[str]
+    vision_descriptions: List[str],
+    clarification_qa: Optional[Dict[str, str]] = None
 ) -> Dict[str, Any]:
     """
     Generate all PDD sections in parallel using thread pool.
@@ -383,15 +499,16 @@ def generate_all_sections_parallel(
     """
     start = time.time()
     results = {}
+    clarification_context = _format_clarification_context(clarification_qa)
 
     tasks = {
-        "purpose": lambda: _generate_purpose_video(project_name, app_name, step_descriptions),
-        "overview_justification": lambda: _generate_overview_video(project_name, app_name, step_descriptions),
-        "as_is": lambda: _generate_as_is_video(project_name, app_name, step_descriptions),
-        "to_be": lambda: _generate_to_be_video(project_name, app_name, step_descriptions),
-        "prerequisites": lambda: _generate_prerequisites_video(project_name, app_name, vision_descriptions),
-        "exceptions": lambda: _generate_exceptions_video(project_name, app_name, step_descriptions),
-        "interfaces": lambda: _generate_interfaces_video(app_name, vision_descriptions),
+        "purpose": lambda: _generate_purpose_video(project_name, app_name, step_descriptions, clarification_context),
+        "overview_justification": lambda: _generate_overview_video(project_name, app_name, step_descriptions, clarification_context),
+        "as_is": lambda: _generate_as_is_video(project_name, app_name, step_descriptions, clarification_context),
+        "to_be": lambda: _generate_to_be_video(project_name, app_name, step_descriptions, clarification_context),
+        "prerequisites": lambda: _generate_prerequisites_video(project_name, app_name, vision_descriptions, clarification_context),
+        "exceptions": lambda: _generate_exceptions_video(project_name, app_name, step_descriptions, clarification_context),
+        "interfaces": lambda: _generate_interfaces_video(app_name, vision_descriptions, clarification_context),
     }
 
     workers = min(config.llm.max_workers, len(tasks))

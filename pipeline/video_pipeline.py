@@ -35,7 +35,10 @@ from video.frame_annotator import annotate_frame
 
 from llm_tasks.vision_describer import analyze_transitions_smart, identify_application
 from llm_tasks.step_synthesizer import synthesize_pdd_steps
-from llm_tasks.document_sections import generate_all_sections_parallel
+from llm_tasks.document_sections import (
+    generate_all_sections_parallel,
+    generate_section_clarification_questions,
+)
 from llm_tasks.flowchart_dot import generate_flowchart_dot_from_steps
 
 from pipeline.common import (
@@ -148,6 +151,7 @@ class VideoPipeline:
     def __init__(self, output_dir: str = None):
         self.output_dir = output_dir or config.paths.output_dir
         os.makedirs(self.output_dir, exist_ok=True)
+        self.pending_questions: List[str] = []
 
     def process(
         self,
@@ -156,7 +160,9 @@ class VideoPipeline:
         ssim_threshold: float = None,
         max_frames: int = None,
         annotate: bool = None,
-        enable_micro_frames: bool = True
+        enable_micro_frames: bool = True,
+        clarification_qa: Optional[Dict[str, str]] = None,
+        require_clarification: bool = True,
     ) -> Optional[str]:
         """
         Process a silent screen recording into a PDD document.
@@ -168,6 +174,8 @@ class VideoPipeline:
             max_frames: Max key frames override.
             annotate: Enable screenshot annotation override.
             enable_micro_frames: Extract micro-frames around changes.
+            clarification_qa: Human answers for LLM clarifying questions.
+            require_clarification: If True, asks clarifying questions before section generation.
 
         Returns:
             Path to generated document, or None on failure.
@@ -175,6 +183,7 @@ class VideoPipeline:
         t0 = time.time()
         tracker = reset_tracker()
         gemini_client.set_tracker(tracker)
+        self.pending_questions = []
 
         ssim_threshold = ssim_threshold or config.frame.ssim_threshold
         annotate = annotate if annotate is not None else config.annotation.enabled
@@ -323,8 +332,33 @@ class VideoPipeline:
             for kf in key_frames
         ]
 
+        clean_qa = {}
+        if clarification_qa:
+            for q, a in clarification_qa.items():
+                q_clean = (q or "").strip()
+                a_clean = (a or "").strip()
+                if q_clean and a_clean:
+                    clean_qa[q_clean] = a_clean
+
+        if require_clarification and not clean_qa:
+            self.pending_questions = generate_section_clarification_questions(
+                project_name=project_name,
+                app_name=app_name,
+                step_descriptions=step_descriptions,
+                vision_descriptions=vision_descriptions,
+            )
+            if self.pending_questions:
+                print("  ! Clarification required before generating sections")
+                for i, q in enumerate(self.pending_questions, start=1):
+                    print(f"    Q{i}. {q}")
+                return None
+
         sections = generate_all_sections_parallel(
-            project_name, app_name, step_descriptions, vision_descriptions
+            project_name,
+            app_name,
+            step_descriptions,
+            vision_descriptions,
+            clarification_qa=clean_qa,
         )
 
         purpose = sections.get("purpose") or ""

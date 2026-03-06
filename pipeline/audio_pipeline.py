@@ -28,6 +28,7 @@ from audio.transcriber import transcribe_audio, read_transcript
 
 from llm_tasks.meeting_compact import (
     generate_doc_bundle_from_transcript,
+    generate_clarification_questions_from_transcript,
     generate_dot_from_transcript
 )
 
@@ -45,6 +46,7 @@ class AudioPipeline:
     def __init__(self, output_dir: str = None):
         self.output_dir = output_dir or config.paths.output_dir
         os.makedirs(self.output_dir, exist_ok=True)
+        self.pending_questions: List[str] = []
 
     def _extract_evenly_spaced_frames(
         self,
@@ -245,7 +247,9 @@ class AudioPipeline:
         video_path: str,
         project_name: str = None,
         whisper_model: str = None,
-        transcript_path: str = None
+        transcript_path: str = None,
+        clarification_qa: Optional[Dict[str, str]] = None,
+        require_clarification: bool = True,
     ) -> Optional[str]:
         """
         Process a meeting recording into a PDD document.
@@ -255,6 +259,8 @@ class AudioPipeline:
             project_name: Optional project name (auto-detected if None).
             whisper_model: Whisper model size override.
             transcript_path: Pre-existing transcript (skips Whisper).
+            clarification_qa: Human answers for LLM clarifying questions.
+            require_clarification: If True, asks clarifying questions before extraction.
 
         Returns:
             Path to generated document, or None on failure.
@@ -262,6 +268,7 @@ class AudioPipeline:
         t0 = time.time()
         tracker = reset_tracker()
         gemini_client.set_tracker(tracker)
+        self.pending_questions = []
 
         print_pipeline_header(
             "Meeting Recording (Audio) — Consolidated",
@@ -296,12 +303,34 @@ class AudioPipeline:
             return None
         print(f"  Transcript: {len(transcript):,} chars")
 
+        clean_qa: Dict[str, str] = {}
+        if clarification_qa:
+            for q, a in clarification_qa.items():
+                q_clean = (q or "").strip()
+                a_clean = (a or "").strip()
+                if q_clean and a_clean:
+                    clean_qa[q_clean] = a_clean
+
+        if require_clarification and not clean_qa:
+            print("\n[2/4] Generating clarifying questions...")
+            self.pending_questions = generate_clarification_questions_from_transcript(
+                transcript=transcript,
+                project_name_hint=project_name,
+            )
+            if self.pending_questions:
+                print("  ! Clarification required before consolidated extraction")
+                for i, q in enumerate(self.pending_questions, start=1):
+                    print(f"    Q{i}. {q}")
+                return None
+
         # ── Step 2: Consolidated LLM Calls (2 calls) ──
         print("\n[2/4] Consolidated LLM extraction (2 calls)...")
         t = time.time()
 
         bundle = generate_doc_bundle_from_transcript(
-            transcript, project_name_hint=project_name
+            transcript,
+            project_name_hint=project_name,
+            clarification_qa=clean_qa,
         )
 
         if not project_name:

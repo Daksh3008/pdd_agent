@@ -207,6 +207,67 @@ def main():
         download_placeholder = st.empty()
         flowchart_placeholder = st.empty()
 
+    # ── LLM Q&A Chat Window ──
+    if "llm_questions" not in st.session_state:
+        st.session_state.llm_questions = []
+    if "llm_answers" not in st.session_state:
+        st.session_state.llm_answers = {}
+
+    st.markdown("---")
+    st.subheader("💬 LLM Q&A")
+    st.caption("Review questions from the LLM and provide text answers before generation.")
+
+    questions = st.session_state.llm_questions
+    answers = st.session_state.llm_answers
+
+    question_display = "\n\n".join(
+        [f"Q{i + 1}: {q}" for i, q in enumerate(questions)]
+    )
+
+    st.text_area(
+        "Questions asked by LLM",
+        value=question_display,
+        height=180,
+        disabled=True,
+        placeholder="No LLM questions yet. Questions will appear here when available."
+    )
+
+    if questions:
+        selected_idx = st.selectbox(
+            "Select question to answer",
+            options=list(range(len(questions))),
+            format_func=lambda i: f"Q{i + 1}: {questions[i][:90]}",
+            key="selected_llm_question"
+        )
+
+        selected_question = questions[selected_idx]
+        current_answer = answers.get(selected_question, "")
+
+        answer_text = st.text_area(
+            "Your answer",
+            value=current_answer,
+            height=120,
+            placeholder="Type your answer here...",
+            key=f"answer_input_{selected_idx}"
+        )
+
+        if st.button("Save Answer", use_container_width=True):
+            st.session_state.llm_answers[selected_question] = answer_text.strip()
+            st.success("Answer saved.")
+
+        with st.expander("Saved Answers", expanded=False):
+            for i, q in enumerate(questions):
+                a = st.session_state.llm_answers.get(q, "")
+                st.markdown(f"**Q{i + 1}:** {q}")
+                st.markdown(f"**A{i + 1}:** {a if a else '_No answer yet_'}")
+
+        if st.button("Clear Q&A", use_container_width=True):
+            st.session_state.llm_questions = []
+            st.session_state.llm_answers = {}
+            st.success("LLM questions and answers cleared.")
+    else:
+        st.info("No LLM questions available yet.")
+
     # ── Validation ──
     can_process = False
     missing = ""
@@ -264,6 +325,12 @@ def main():
 
             with st.spinner("Processing... This may take a few minutes."):
                 try:
+                    clarification_qa = {
+                        q: a.strip()
+                        for q, a in st.session_state.llm_answers.items()
+                        if (a or "").strip()
+                    }
+
                     if input_mode == "🗣️ Meeting Recording (Audio+Video)":
                         status_placeholder.info(
                             "🔄 Running Audio Pipeline "
@@ -274,25 +341,60 @@ def main():
                             video_path=video_path,
                             project_name=project_name.strip() if project_name else None,
                             whisper_model=whisper_model,
-                            transcript_path=transcript_path
+                            transcript_path=transcript_path,
+                            clarification_qa=clarification_qa,
+                            require_clarification=True,
                         )
+
+                        if not result_path and getattr(agent, "pending_questions", None):
+                            st.session_state.llm_questions = agent.pending_questions
+                            st.session_state.llm_answers = {
+                                q: st.session_state.llm_answers.get(q, "")
+                                for q in agent.pending_questions
+                            }
+                            output_placeholder.warning(
+                                "LLM needs clarifications before section generation. "
+                                "Answer questions in the LLM Q&A area, then click Generate again."
+                            )
+                            status_placeholder.info("⏸ Waiting for human answers...")
+                            st.rerun()
 
                     elif input_mode == "🔇 Silent Screen Recording (Video Only)":
                         status_placeholder.info("🔄 Running Video Pipeline (Vision AI)...")
                         agent = VideoPipeline(output_dir)
+
                         result_path = agent.process(
                             video_path=video_path,
                             project_name=project_name.strip(),
                             ssim_threshold=ssim_threshold,
                             max_frames=max_frames,
                             annotate=annotate,
-                            enable_micro_frames=enable_micro_frames
+                            enable_micro_frames=enable_micro_frames,
+                            clarification_qa=clarification_qa,
+                            require_clarification=True,
                         )
+
+                        if not result_path and getattr(agent, "pending_questions", None):
+                            st.session_state.llm_questions = agent.pending_questions
+                            # Keep answers only for current questions.
+                            st.session_state.llm_answers = {
+                                q: st.session_state.llm_answers.get(q, "")
+                                for q in agent.pending_questions
+                            }
+                            output_placeholder.warning(
+                                "LLM needs clarifications before section generation. "
+                                "Answer questions in the LLM Q&A area, then click Generate again."
+                            )
+                            status_placeholder.info("⏸ Waiting for human answers...")
+                            st.rerun()
 
                     # Handle result
                     if result_path and os.path.exists(result_path):
                         output_placeholder.success(f"✅ {doc_label} Generated Successfully!")
                         status_placeholder.empty()
+
+                        # Questions are no longer needed after successful generation.
+                        st.session_state.llm_questions = []
 
                         with open(result_path, "rb") as f:
                             doc_bytes = f.read()

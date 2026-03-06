@@ -111,13 +111,105 @@ def _strip_markdown(text: str) -> str:
     return text
 
 
+def _format_clarification_context(clarification_qa: Optional[Dict[str, str]]) -> str:
+    """Format human-provided clarifications for transcript prompts."""
+    if not clarification_qa:
+        return ""
+
+    lines: List[str] = []
+    for i, (q, a) in enumerate(clarification_qa.items(), start=1):
+        q_clean = redact_pii_text((q or "").strip())
+        a_clean = redact_pii_text((a or "").strip())
+        if q_clean and a_clean:
+            lines.append(f"{i}. Q: {q_clean}\n   A: {a_clean}")
+
+    if not lines:
+        return ""
+
+    return (
+        "Human Clarifications (authoritative context):\n"
+        + "\n".join(lines)
+        + "\nUse this context whenever relevant to remove ambiguity.\n"
+    )
+
+
+def generate_clarification_questions_from_transcript(
+    transcript: str,
+    project_name_hint: Optional[str] = None,
+    max_questions: int = 5,
+) -> List[str]:
+    """Generate clarifying questions before consolidated transcript extraction."""
+    sample = safe_sample(transcript, max_len=config.llm.max_sample_text)
+    project_hint = project_name_hint or "(not provided)"
+
+    prompt = f"""You are preparing to generate a high-quality Process Definition Document from a meeting transcript.
+
+Project name hint: "{project_hint}"
+
+TASK:
+Ask only the minimum clarifying questions that would materially improve document quality.
+
+RULES:
+- Ask at most {max_questions} questions.
+- Questions must help improve: purpose, overview, as-is, to-be, process steps, or requirements.
+- Keep each question specific and answerable in 1-3 sentences.
+- Output only questions, one per line.
+- Do not include numbering, headings, or explanations.
+
+TRANSCRIPT:
+{sample}
+"""
+
+    resp = gemini_client.generate(
+        prompt=prompt,
+        system_prompt=get_system_prompt(),
+        temperature=0.2,
+        max_output_tokens=1200,
+        call_name="DocBundle_ClarificationQuestions",
+        max_retries=3,
+    )
+
+    fallback_questions = [
+        "What is the primary business outcome this automation must deliver?",
+        "Which input sources and output destinations are in scope for the process?",
+        "What are the top exception scenarios and expected handling actions?",
+    ]
+
+    if not resp:
+        return fallback_questions[:max_questions]
+
+    questions: List[str] = []
+    for line in resp.splitlines():
+        q = re.sub(r"^\s*(?:\d+[\.)]\s*|[-*]\s*)", "", line).strip()
+        q = re.sub(r'^"|"$', "", q).strip()
+        if not q or len(q) <= 8:
+            continue
+        if "?" not in q:
+            q = q.rstrip(".:") + "?"
+        questions.append(q)
+
+    deduped: List[str] = []
+    seen = set()
+    for q in questions:
+        key = q.lower()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(q)
+
+    if not deduped:
+        return fallback_questions[:max_questions]
+
+    return deduped[:max_questions]
+
+
 # ============================================================
 # Call 1: Document Sections
 # ============================================================
 
 def _generate_document_sections(
     transcript: str,
-    project_name_hint: Optional[str] = None
+    project_name_hint: Optional[str] = None,
+    clarification_qa: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
     LLM Call 1: Extract project name + all narrative document sections.
@@ -129,6 +221,7 @@ def _generate_document_sections(
 
     project_hint = f'Project name hint: "{project_name_hint}"' if project_name_hint else \
         "Derive a short descriptive project name (max 6 words) from the main process discussed."
+    clarification_context = _format_clarification_context(clarification_qa)
 
     prompt = f"""You are a senior Business Analyst creating a {doc_full} ({doc_type}).
 
@@ -187,6 +280,8 @@ JSON FORMAT:
 
 TRANSCRIPT:
 {sample}
+
+{clarification_context}
 """
 
     resp = gemini_client.generate(
@@ -357,7 +452,8 @@ def _fallback_parse_sections(raw_text: str) -> Dict[str, str]:
 def _generate_process_data(
     transcript: str,
     project_name: str,
-    entities: Dict
+    entities: Dict,
+    clarification_qa: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
     LLM Call 2: Extract process steps, detailed steps, and all requirements tables.
@@ -367,6 +463,7 @@ def _generate_process_data(
     apps_hint = ""
     if entities.get("applications"):
         apps_hint = f"Applications mentioned: {', '.join(entities['applications'])}"
+    clarification_context = _format_clarification_context(clarification_qa)
 
     prompt = f"""You are a senior Business Analyst extracting automation process data.
 
@@ -435,6 +532,8 @@ CRITICAL RULES:
 
 TRANSCRIPT:
 {sample}
+
+{clarification_context}
 """
 
     resp = gemini_client.generate(
@@ -631,7 +730,8 @@ def _fallback_parse_process_data(raw_text: str) -> Dict[str, Any]:
 
 def generate_doc_bundle_from_transcript(
     transcript: str,
-    project_name_hint: Optional[str] = None
+    project_name_hint: Optional[str] = None,
+    clarification_qa: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
     Two consolidated LLM calls to extract ALL PDD content.
@@ -642,14 +742,23 @@ def generate_doc_bundle_from_transcript(
 
     # Call 1: Sections
     print("    [DocBundle] Call 1/2: Document sections...")
-    sections_result = _generate_document_sections(transcript, project_name_hint)
+    sections_result = _generate_document_sections(
+        transcript,
+        project_name_hint,
+        clarification_qa=clarification_qa,
+    )
 
     project_name = sections_result["project_name"]
     entities = sections_result["entities"]
 
     # Call 2: Process data
     print("    [DocBundle] Call 2/2: Process steps & requirements...")
-    process_result = _generate_process_data(transcript, project_name, entities)
+    process_result = _generate_process_data(
+        transcript,
+        project_name,
+        entities,
+        clarification_qa=clarification_qa,
+    )
 
     # Combine
     result = {
