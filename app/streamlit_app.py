@@ -2,10 +2,9 @@
 
 """
 Unified Streamlit Frontend for PDD Agent.
-Supports three modes:
-1. Meeting Recording (Audio Pipeline)
-2. Silent Screen Recording (Video Pipeline)
-3. Transcript Only (Audio Pipeline)
+Two modes:
+1. Meeting Recording (Audio+Video) — transcript optional, auto-generated if missing
+2. Silent Screen Recording (Video Only) — vision-based analysis
 """
 
 import streamlit as st
@@ -16,7 +15,6 @@ import tempfile
 # load .env file first
 from dotenv import load_dotenv
 load_dotenv()
-
 
 # Ensure project root is in path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -36,10 +34,10 @@ def main():
         layout="wide"
     )
 
-    st.title("📄 Unified PDD Generation Agent")
+    st.title("📄 PDD Generation Agent")
     st.markdown(
         "Convert meeting recordings or silent screen recordings into "
-        "comprehensive Process Definition Documents (PDD)."
+        "comprehensive Process Definition Documents."
     )
 
     # ── Sidebar ──
@@ -49,13 +47,16 @@ def main():
         st.subheader("🤖 AI Model (Google Gemini)")
         api_ok = gemini_client.is_available()
 
-        if api_ok:
+        if gemini_client.is_configured() and api_ok:
             st.success("✓ Gemini API Connected")
-            st.caption(f"Text: `{config.gemini.text_model}`")
-            st.caption(f"Vision: `{config.gemini.vision_model}`")
+            st.caption(f"Model: `{config.gemini.text_model}`")
+            st.caption(f"RPM: {config.gemini.requests_per_minute}")
+        elif gemini_client.is_configured() and not api_ok:
+            st.warning("⚠ Gemini configured but health-check failed")
+            st.caption(gemini_client.last_health_error() or "Unknown error")
         else:
             st.error("✗ Gemini API Not Connected")
-            st.caption("Please set GEMINI_API_KEY environment variable.")
+            st.caption("Set GEMINI_API_KEY environment variable.")
 
         st.markdown("---")
 
@@ -64,15 +65,15 @@ def main():
             [
                 "🗣️ Meeting Recording (Audio+Video)",
                 "🔇 Silent Screen Recording (Video Only)",
-                "📝 Transcript Only"
             ],
             index=0,
-            help="Choose the type of input you are providing."
+            help="Meeting Recording: has audio (or provide transcript). "
+                 "Silent Recording: no audio, vision-based analysis."
         )
 
         st.markdown("---")
 
-        # Document type selection
+        # Document type
         doc_type_choice = st.selectbox(
             "📋 Document Type",
             [
@@ -96,7 +97,7 @@ def main():
                 "Whisper Model",
                 ["base", "small", "medium", "large"],
                 index=0,
-                help="Larger models are more accurate but slower."
+                help="Used only if no transcript is provided. Larger = more accurate but slower."
             )
         else:
             whisper_model = "base"
@@ -104,14 +105,14 @@ def main():
         if input_mode == "🔇 Silent Screen Recording (Video Only)":
             st.markdown("---")
             st.subheader("🎬 Video Settings")
-            
+
             ssim_threshold = st.slider(
                 "Scene Sensitivity",
                 min_value=0.70, max_value=0.95,
                 value=config.frame.ssim_threshold, step=0.05,
                 help="Lower = more sensitive (detects smaller changes)."
             )
-            
+
             max_frames = st.number_input(
                 "Max Key Frames",
                 min_value=10, max_value=150,
@@ -121,19 +122,28 @@ def main():
             enable_micro_frames = st.checkbox(
                 "Enable Micro-frames",
                 value=True,
-                help="Extract extra frames around clicks/changes to catch transient UI states."
+                help="Extract extra frames around changes for better coverage."
             )
 
             annotate = st.checkbox(
                 "Annotate Screenshots",
                 value=config.annotation.enabled,
-                help="Draw red boxes and arrows to highlight detected changes."
+                help="Draw highlights on screenshots to indicate detected changes."
             )
         else:
             ssim_threshold = config.frame.ssim_threshold
             max_frames = config.frame.max_key_frames
             enable_micro_frames = False
             annotate = config.annotation.enabled
+
+        # PII Redaction toggle
+        st.markdown("---")
+        st.subheader("🔒 Privacy")
+        config.redaction.enabled = st.checkbox(
+            "Enable PII Redaction",
+            value=config.redaction.enabled,
+            help="Black out names, emails, phone numbers in screenshots and text."
+        )
 
     # ── Main Content ──
     col1, col2 = st.columns([1, 1])
@@ -151,25 +161,28 @@ def main():
         transcript_file = None
         transcript_text = None
 
-        # Video upload
-        if input_mode in ["🗣️ Meeting Recording (Audio+Video)", "🔇 Silent Screen Recording (Video Only)"]:
-            st.subheader("🎬 Video File")
-            video_file = st.file_uploader(
-                "Upload Video",
-                type=["mp4", "avi", "mov", "mkv", "webm"]
-            )
-            if video_file:
-                st.video(video_file)
-                size_mb = len(video_file.getvalue()) / (1024 * 1024)
-                st.caption(f"📏 {size_mb:.1f} MB")
+        # Video upload (both modes)
+        st.subheader("🎬 Video File")
+        video_file = st.file_uploader(
+            "Upload Video",
+            type=["mp4", "avi", "mov", "mkv", "webm"]
+        )
+        if video_file:
+            st.video(video_file)
+            size_mb = len(video_file.getvalue()) / (1024 * 1024)
+            st.caption(f"📏 {size_mb:.1f} MB")
 
-        # Transcript upload
-        if input_mode == "📝 Transcript Only":
-            st.subheader("📝 Transcript")
+        # Transcript upload (Meeting Recording mode only)
+        if input_mode == "🗣️ Meeting Recording (Audio+Video)":
+            st.subheader("📝 Transcript (Optional)")
+            st.caption("Provide a transcript to skip Whisper transcription. "
+                       "If not provided, audio will be transcribed automatically.")
+
             transcript_input_method = st.radio(
-                "Input Method", ["Upload File", "Paste Text"], index=0
+                "Transcript Input", ["None (Auto-transcribe)", "Upload File", "Paste Text"],
+                index=0
             )
-            
+
             if transcript_input_method == "Upload File":
                 transcript_file = st.file_uploader(
                     "Upload Transcript", type=["txt", "srt", "vtt"]
@@ -178,12 +191,13 @@ def main():
                     preview = transcript_file.read().decode("utf-8", errors="replace")
                     transcript_file.seek(0)
                     with st.expander("Preview", expanded=False):
-                        st.text(preview[:1000] + "...")
-            else:
+                        st.text(preview[:1000] + ("..." if len(preview) > 1000 else ""))
+
+            elif transcript_input_method == "Paste Text":
                 transcript_text = st.text_area(
                     "Paste Transcript",
-                    height=300,
-                    placeholder="[0.00 - 5.23] User: We need to automate this..."
+                    height=200,
+                    placeholder="Paste your transcript here..."
                 )
 
     with col2:
@@ -200,21 +214,16 @@ def main():
     if input_mode == "🗣️ Meeting Recording (Audio+Video)":
         can_process = bool(video_file)
         missing = "Upload a meeting recording video."
-    
+
     elif input_mode == "🔇 Silent Screen Recording (Video Only)":
         can_process = bool(video_file) and bool(project_name.strip())
         if not project_name.strip():
             missing = "Project Name is required for silent videos."
         elif not video_file:
             missing = "Upload a silent screen recording."
-            
-    elif input_mode == "📝 Transcript Only":
-        can_process = bool(transcript_file) or bool(transcript_text and transcript_text.strip())
-        missing = "Upload or paste a transcript."
 
     # ── Process Button ──
     st.markdown("---")
-
     doc_label = config.document.document_type
 
     if st.button(
@@ -253,20 +262,23 @@ def main():
             output_dir = os.path.join(temp_dir, "output")
             result_path = None
 
-            with st.spinner("Processing... This may take a few minutes depending on video length."):
+            with st.spinner("Processing... This may take a few minutes."):
                 try:
-                    # Route to correct pipeline
                     if input_mode == "🗣️ Meeting Recording (Audio+Video)":
-                        status_placeholder.info("🔄 Running Audio Pipeline (Transcription + LLM Analysis)...")
+                        status_placeholder.info(
+                            "🔄 Running Audio Pipeline "
+                            f"({'using provided transcript' if transcript_path else 'auto-transcribing'})..."
+                        )
                         agent = AudioPipeline(output_dir)
                         result_path = agent.process(
                             video_path=video_path,
                             project_name=project_name.strip() if project_name else None,
-                            whisper_model=whisper_model
+                            whisper_model=whisper_model,
+                            transcript_path=transcript_path
                         )
 
                     elif input_mode == "🔇 Silent Screen Recording (Video Only)":
-                        status_placeholder.info("🔄 Running Video Pipeline (Vision AI + Step Synthesis)...")
+                        status_placeholder.info("🔄 Running Video Pipeline (Vision AI)...")
                         agent = VideoPipeline(output_dir)
                         result_path = agent.process(
                             video_path=video_path,
@@ -277,20 +289,11 @@ def main():
                             enable_micro_frames=enable_micro_frames
                         )
 
-                    elif input_mode == "📝 Transcript Only":
-                        status_placeholder.info("🔄 Running Audio Pipeline (Transcript to PDD)...")
-                        agent = AudioPipeline(output_dir)
-                        result_path = agent.process_transcript_only(
-                            transcript_path=transcript_path,
-                            project_name=project_name.strip() if project_name else None
-                        )
-
-                    # Handle successful generation
+                    # Handle result
                     if result_path and os.path.exists(result_path):
                         output_placeholder.success(f"✅ {doc_label} Generated Successfully!")
                         status_placeholder.empty()
 
-                        # Provide download button
                         with open(result_path, "rb") as f:
                             doc_bytes = f.read()
 
@@ -302,19 +305,19 @@ def main():
                             use_container_width=True
                         )
 
-                        # Display flowchart if available
+                        # Display flowchart
                         flowchart_path = os.path.join(output_dir, "flowchart.png")
                         if os.path.exists(flowchart_path):
                             flowchart_placeholder.image(
-                                flowchart_path, caption="Generated Process Flowchart"
+                                flowchart_path, caption="Process Flowchart"
                             )
 
-                        st.info(f"📁 Persistent files saved to: `{config.paths.output_dir}/`")
+                        st.info(f"📁 Files saved to: `{config.paths.output_dir}/`")
                     else:
                         output_placeholder.error(f"Failed to generate {doc_label}. Check terminal logs.")
 
                 except Exception as e:
-                    output_placeholder.error(f"Error during processing: {str(e)}")
+                    output_placeholder.error(f"Error: {str(e)}")
                     status_placeholder.empty()
                     st.exception(e)
 

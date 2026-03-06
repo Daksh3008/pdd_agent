@@ -2,11 +2,13 @@
 
 """
 Shared utility functions used across both pipelines.
-Text processing, sampling, entity verification, operation detection, auth detection.
+Text processing, sampling, entity verification, operation detection,
+auth detection, PII redaction, tone validation.
 """
 
 import re
 import time
+import os
 from typing import List, Set, Dict, Optional
 
 from core.config import (
@@ -64,6 +66,259 @@ def split_into_chunks(text: str) -> List[str]:
 
 
 # ============================================================
+# PII Redaction
+# ============================================================
+
+# Common name patterns (first names) — kept small, extend as needed
+_COMMON_FIRST_NAMES = {
+    'james', 'john', 'robert', 'michael', 'william', 'david', 'richard',
+    'joseph', 'thomas', 'charles', 'mary', 'patricia', 'jennifer', 'linda',
+    'elizabeth', 'barbara', 'susan', 'jessica', 'sarah', 'karen', 'nancy',
+    'daniel', 'matthew', 'anthony', 'mark', 'donald', 'steven', 'paul',
+    'andrew', 'joshua', 'kenneth', 'kevin', 'brian', 'george', 'timothy',
+    'ronald', 'edward', 'jason', 'jeffrey', 'ryan', 'jacob', 'gary',
+    'nicholas', 'eric', 'jonathan', 'stephen', 'larry', 'justin', 'scott',
+    'brandon', 'benjamin', 'samuel', 'raymond', 'gregory', 'frank', 'alexander',
+    'patrick', 'jack', 'dennis', 'jerry', 'tyler', 'aaron', 'jose',
+    'adam', 'nathan', 'henry', 'peter', 'zachary', 'douglas', 'harold',
+    'amy', 'angela', 'melissa', 'brenda', 'anna', 'samantha', 'katherine',
+    'christine', 'deborah', 'rachel', 'carolyn', 'janet', 'catherine',
+    'maria', 'heather', 'diane', 'ruth', 'julie', 'olivia', 'joyce',
+    'virginia', 'victoria', 'kelly', 'lauren', 'christina', 'joan',
+    'evelyn', 'judith', 'megan', 'andrea', 'cheryl', 'hannah', 'jacqueline',
+    'martha', 'gloria', 'teresa', 'ann', 'sara', 'madison', 'frances',
+    'kathryn', 'janice', 'jean', 'abigail', 'alice', 'judy', 'sophia',
+    'grace', 'denise', 'amber', 'doris', 'marilyn', 'danielle', 'beverly',
+    'isabella', 'theresa', 'diana', 'natalie', 'brittany', 'charlotte',
+    'marie', 'kayla', 'alexis', 'lori',
+}
+
+# Email pattern
+_EMAIL_PATTERN = re.compile(
+    r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+)
+
+# Phone patterns (US/international)
+_PHONE_PATTERNS = [
+    re.compile(r'\b\+?1?[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b'),
+    re.compile(r'\b\d{3}[-.\s]\d{3}[-.\s]\d{4}\b'),
+    re.compile(r'\b\(\d{3}\)\s*\d{3}[-.\s]?\d{4}\b'),
+    re.compile(r'\b\+\d{1,3}[-.\s]?\d{4,14}\b'),
+]
+
+# Name-like patterns: "Mr./Mrs./Dr. Lastname", "FirstName LastName"
+_NAME_PATTERNS = [
+    re.compile(r'\b(?:Mr|Mrs|Ms|Miss|Dr|Prof)\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\b'),
+    re.compile(r'\b[A-Z][a-z]{2,15}\s+[A-Z][a-z]{2,20}\b'),
+]
+
+
+def redact_pii_text(text: str) -> str:
+    """Redact PII from text: emails, phone numbers, personal names."""
+    if not text or not config.redaction.enabled or not config.redaction.redact_in_text:
+        return text
+
+    placeholder = config.redaction.redaction_placeholder
+    redacted = text
+
+    # Redact emails
+    if config.redaction.redact_emails:
+        redacted = _EMAIL_PATTERN.sub(placeholder, redacted)
+
+    # Redact phone numbers
+    if config.redaction.redact_phone_numbers:
+        for pattern in _PHONE_PATTERNS:
+            redacted = pattern.sub(placeholder, redacted)
+
+    # Redact names
+    if config.redaction.redact_names:
+        for pattern in _NAME_PATTERNS:
+            matches = pattern.finditer(redacted)
+            for match in sorted(matches, key=lambda m: m.start(), reverse=True):
+                candidate = match.group()
+                words = candidate.split()
+                # Check if any word is a known first name
+                has_name = any(w.lower() in _COMMON_FIRST_NAMES for w in words)
+                # Also check "Title Lastname" pattern
+                has_title = any(
+                    w.lower().rstrip('.') in {'mr', 'mrs', 'ms', 'miss', 'dr', 'prof'}
+                    for w in words
+                )
+                if has_name or has_title:
+                    redacted = redacted[:match.start()] + placeholder + redacted[match.end():]
+
+    return redacted
+
+
+def redact_pii_from_image(image_path: str, ocr_boxes: List[Dict] = None) -> str:
+    """
+    Redact PII from screenshot by blacking out regions containing PII text.
+    Returns path to redacted image (overwrites original).
+    """
+    if not config.redaction.enabled or not config.redaction.redact_in_screenshots:
+        return image_path
+
+    if not image_path or not os.path.exists(image_path):
+        return image_path
+
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return image_path
+
+    img = cv2.imread(image_path)
+    if img is None:
+        return image_path
+
+    modified = False
+
+    if ocr_boxes:
+        for box in ocr_boxes:
+            word = box.get("text", "")
+            if _is_pii_word(word):
+                x = box.get("x", 0)
+                y = box.get("y", 0)
+                w = box.get("w", 0)
+                h = box.get("h", 0)
+                pad = 3
+                x1 = max(0, x - pad)
+                y1 = max(0, y - pad)
+                x2 = min(img.shape[1], x + w + pad)
+                y2 = min(img.shape[0], y + h + pad)
+                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 0), -1)
+                modified = True
+    else:
+        # If no OCR boxes provided, try OCR to find PII regions
+        try:
+            from video.ocr_engine import OCR_AVAILABLE
+            if OCR_AVAILABLE:
+                import pytesseract
+                from PIL import Image
+                pil_img = Image.open(image_path)
+                box_data = pytesseract.image_to_data(
+                    pil_img, output_type=pytesseract.Output.DICT, config='--psm 6'
+                )
+                for i in range(len(box_data['text'])):
+                    word = box_data['text'][i].strip()
+                    conf = int(box_data['conf'][i])
+                    if word and conf > 30 and _is_pii_word(word):
+                        x = box_data['left'][i]
+                        y = box_data['top'][i]
+                        w = box_data['width'][i]
+                        h = box_data['height'][i]
+                        pad = 3
+                        x1 = max(0, x - pad)
+                        y1 = max(0, y - pad)
+                        x2 = min(img.shape[1], x + w + pad)
+                        y2 = min(img.shape[0], y + h + pad)
+                        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 0), -1)
+                        modified = True
+        except Exception:
+            pass
+
+    if modified:
+        cv2.imwrite(image_path, img)
+
+    return image_path
+
+
+def _is_pii_word(word: str) -> bool:
+    """Check if a single word/token is PII."""
+    if not word or len(word) < 2:
+        return False
+
+    # Email check
+    if _EMAIL_PATTERN.match(word):
+        return True
+
+    # Phone fragments — skip, handled at sentence level
+    # Name check
+    if word.lower() in _COMMON_FIRST_NAMES and word[0].isupper():
+        return True
+
+    # "@" in word likely email fragment
+    if '@' in word:
+        return True
+
+    return False
+
+
+# ============================================================
+# Tone / Style Validation
+# ============================================================
+
+_FIRST_PERSON_PATTERNS = re.compile(
+    r'\b(I|we|my|our|me|us|myself|ourselves)\b', re.IGNORECASE
+)
+_INFORMAL_STARTS = [
+    'i want', 'i need', 'we need', 'we want', 'let me', 'let us',
+    'you should', 'you need', 'you can', 'please note',
+    'as discussed', 'as mentioned', 'as per our', 'as we discussed',
+    'in the meeting', 'during the call', 'the transcript',
+    'the recording', 'the video', 'the speaker',
+]
+
+
+def enforce_tone(text: str) -> str:
+    """
+    Post-process text to enforce third-person, present-tense, formal tone.
+    Removes first-person references and informal language.
+    """
+    if not text:
+        return text
+
+    lines = text.split('\n')
+    cleaned_lines = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            cleaned_lines.append(line)
+            continue
+
+        # Skip lines that are pure informal references
+        lower = stripped.lower()
+        if any(lower.startswith(p) for p in _INFORMAL_STARTS):
+            continue
+
+        # Replace first-person with third-person
+        cleaned = _FIRST_PERSON_PATTERNS.sub(
+            lambda m: _first_to_third(m.group()), stripped
+        )
+
+        # Remove meeting/transcript references
+        cleaned = re.sub(
+            r'\b(?:in the meeting|during the call|as discussed|'
+            r'the transcript|the recording|the speaker said|'
+            r'they mentioned|it was discussed)\b',
+            '', cleaned, flags=re.IGNORECASE
+        )
+
+        # Clean up double spaces
+        cleaned = re.sub(r'\s{2,}', ' ', cleaned).strip()
+
+        if cleaned:
+            cleaned_lines.append(cleaned)
+
+    return '\n'.join(cleaned_lines)
+
+
+def _first_to_third(word: str) -> str:
+    """Convert first-person pronoun to third-person equivalent."""
+    mapping = {
+        'i': 'the system', 'I': 'The system',
+        'we': 'the system', 'We': 'The system',
+        'my': 'the', 'My': 'The',
+        'our': 'the', 'Our': 'The',
+        'me': 'the system', 'Me': 'The system',
+        'us': 'the system', 'Us': 'The system',
+        'myself': 'itself', 'ourselves': 'itself',
+    }
+    return mapping.get(word, word)
+
+
+# ============================================================
 # Entity Helpers
 # ============================================================
 
@@ -109,7 +364,7 @@ def verify_entities_against_transcript(entities: Dict, transcript: str) -> Dict:
                 if _appears(item):
                     verified_items.append(item)
                 else:
-                    print(f"    [Entities] ⚠ Removed hallucinated: '{item}'")
+                    print(f"    [Entities] Removed hallucinated: '{item}'")
             verified[key] = verified_items
         else:
             verified[key] = items
@@ -159,7 +414,7 @@ def parse_numbered_steps(text: str) -> List[str]:
             'here are', 'following', 'process steps', 'transcript',
             'note:', 'section', 'based on', 'the above', 'these are',
             'below', 'i have', 'let me', 'sure,', 'certainly',
-            'wrong', 'correct', 'critical', 'example', '❌', '✅',
+            'wrong', 'correct', 'critical', 'example',
             'important', 'context', 'the meeting', 'discussed',
             'use only', 'names from'
         ]

@@ -1,8 +1,10 @@
-# llm/entity_extraction.py
+# llm_tasks/entity_extraction.py
 
 """
 Entity extraction and project name detection from transcript.
 Used by the audio pipeline to identify key entities.
+Kept as standalone for backward compatibility — the consolidated
+bundle call in meeting_compact.py also extracts entities.
 """
 
 import time
@@ -19,22 +21,25 @@ def extract_entities_and_project(
 ) -> Tuple[Dict[str, List[str]], str]:
     """
     Extract named entities and project name from transcript.
-    
     Returns:
         Tuple of (entities dict, project name string)
     """
     start = time.time()
     sample = safe_sample(transcript, max_len=config.llm.max_sample_entity)
 
-    prompt = f"""Extract factual information from this meeting transcript.
+    prompt = f"""You are a senior Business Analyst. Extract factual information from this meeting transcript.
 
-RULES:
-- ONLY extract names EXPLICITLY mentioned in the text
-- Do NOT guess or correct names — write them exactly as they appear
-- If no names are mentioned for a category, write "None"
-- For the project name: if not stated, create a short descriptive name from the main process discussed
+YOUR TASK:
+Identify all named entities explicitly mentioned in the text.
 
-OUTPUT FORMAT (exactly as shown):
+STRICT RULES:
+- ONLY extract names EXPLICITLY mentioned in the text.
+- Do NOT guess, infer, or correct names. Write them exactly as they appear.
+- If no names exist for a category, write "None".
+- For the project name: if not explicitly stated, create a short descriptive name (max 6 words) from the main process discussed.
+- NEVER include personal names, email addresses, or phone numbers.
+
+OUTPUT FORMAT (exactly as shown, no other text):
 COMPANIES: name1, name2
 APPLICATIONS: name1, name2
 SYSTEMS: name1, name2

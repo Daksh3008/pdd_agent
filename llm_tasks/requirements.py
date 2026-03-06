@@ -1,9 +1,8 @@
-# llm/requirements.py
+# llm_tasks/requirements.py
 
 """
 Requirements extraction from transcript.
-Input requirements, interface requirements, exception handling.
-Used by the audio pipeline.
+Used as FALLBACK — primary extraction is via meeting_compact.py.
 """
 
 import re
@@ -12,8 +11,8 @@ from typing import Dict, List
 
 from core.gemini_client import gemini_client
 from core.config import config
-from core.utils import timed, safe_sample
-from llm_tasks.system_prompts import get_system_prompt
+from core.utils import timed, safe_sample, redact_pii_text
+from llm_tasks.system_prompts import get_system_prompt, TONE_RULES
 
 
 def get_input_requirements(
@@ -24,41 +23,37 @@ def get_input_requirements(
     """Extract input requirements from transcript."""
     start = time.time()
     sample = safe_sample(transcript, max_len=config.llm.max_sample_small)
-    doc_type = config.document.document_type
 
-    if doc_type == "BRD":
-        context = (
-            "List 3-8 business inputs and data sources the solution requires.\n"
-            "Focus on business data, not technical credentials."
-        )
-    else:
-        context = (
-            "List 3-8 inputs the automation needs. Consider:\n"
-            "- Credentials/access for applications\n"
-            "- Source data (files, databases, portals)\n"
-            "- Configuration parameters"
-        )
-
-    prompt = f"""Identify input requirements for this project.
+    prompt = f"""You are a senior Business Analyst identifying input requirements for an automation project.
 
 Project: "{project_name}". {entity_hint}
 
-{context}
+YOUR TASK:
+List 5-10 input parameters the automation requires to execute.
 
-Use ONLY names from the transcript.
+Consider:
+- Application credentials (username, password — never actual values)
+- Source data files or database connections
+- Application URLs or endpoints
+- Configuration parameters (thresholds, filters, date ranges)
+- Output file paths or destinations
 
-FORMAT (one per line):
-INPUT: Parameter Name | DESCRIPTION: What it is and why needed
+FORMAT (one per line, use | separator):
+INPUT: Parameter Name | DESCRIPTION: What it is and why the automation needs it
+
+RULES:
+- NEVER include actual credential values, personal names, or email addresses.
+- Use ONLY application names from the transcript.
 
 TRANSCRIPT:
 {sample}
 
-INPUTS:"""
+OUTPUT:"""
 
     response = gemini_client.generate(
         prompt=prompt,
         system_prompt=get_system_prompt(),
-        call_name="InputRequirements"
+        call_name="InputRequirements_Fallback"
     )
     timed("Inputs", start)
 
@@ -66,7 +61,7 @@ INPUTS:"""
     if response:
         for line in response.split('\n'):
             line = line.strip()
-            if '|' in line and 'INPUT' in line.upper():
+            if '|' in line:
                 parts = line.split('|')
                 param, desc = "", ""
                 for part in parts:
@@ -83,18 +78,18 @@ INPUTS:"""
                         ).strip()
                 if param:
                     inputs.append({
-                        "parameter": param,
-                        "description": desc or "Required for execution."
+                        "parameter": redact_pii_text(param),
+                        "description": redact_pii_text(desc) or "Required for automation execution."
                     })
 
     if not inputs:
         inputs = [
             {"parameter": "Application Credentials",
-             "description": "Authorized credentials for secure access."},
-            {"parameter": "Source Data",
-             "description": "Data from source applications."},
-            {"parameter": "Automation Configuration",
-             "description": "Configured workflow for execution."},
+             "description": "Authorized username and password for secure application access."},
+            {"parameter": "Source Data Location",
+             "description": "File path or database connection for source data retrieval."},
+            {"parameter": "Application URL",
+             "description": "Web address of the target application portal."},
         ]
     return inputs
 
@@ -113,24 +108,26 @@ def get_interface_requirements(
             f"{', '.join(entities['applications'])}"
         )
 
-    prompt = f"""Identify application interfaces needed for this automation.
+    prompt = f"""You are a senior Business Analyst identifying interface requirements.
 
 {apps_hint}
 
-ONLY list applications explicitly mentioned in the transcript.
+YOUR TASK:
+List all applications and systems the automation interacts with.
+ONLY include applications explicitly mentioned in the transcript.
 
-FORMAT (one per line):
-APP: Name | INTERFACE: Web/Desktop/API/Database | PURPOSE: Why needed
+FORMAT (one per line, use | separator):
+APP: Application Name | INTERFACE: Web/Desktop/API/Database | PURPOSE: Why the automation uses it
 
 TRANSCRIPT:
 {sample}
 
-INTERFACES:"""
+OUTPUT:"""
 
     response = gemini_client.generate(
         prompt=prompt,
         system_prompt=get_system_prompt(),
-        call_name="InterfaceRequirements"
+        call_name="InterfaceRequirements_Fallback"
     )
     timed("Interfaces", start)
 
@@ -161,8 +158,10 @@ INTERFACES:"""
 
     if not apps:
         apps = [{
-            "application": "N/A", "interface": "N/A",
-            "url": "N/A", "purpose": "N/A"
+            "application": "Target Application",
+            "interface": "Web/Desktop",
+            "url": "",
+            "purpose": "Primary application for process automation"
         }]
     return apps
 
@@ -175,38 +174,32 @@ def get_exception_handling(
     """Generate exception handling scenarios from transcript."""
     start = time.time()
     sample = safe_sample(transcript, max_len=config.llm.max_sample_small)
-    doc_type = config.document.document_type
 
-    if doc_type == "BRD":
-        context = (
-            "List 5-8 business exception scenarios and required system behavior.\n"
-            "Focus on business impact and recovery requirements."
-        )
-    else:
-        context = (
-            "List 5-8 technical exception scenarios and how the system handles each.\n"
-            "Consider: login failures, missing data, records not found, "
-            "processing errors, validation failures, system errors."
-        )
-
-    prompt = f"""Write exception handling scenarios.
+    prompt = f"""You are a senior Business Analyst defining exception handling for an automation project.
 
 Project: "{project_name}". {entity_hint}
 
-{context}
+YOUR TASK:
+List 6-10 exception scenarios and how the system handles each.
 
-FORMAT (one per line):
-EXCEPTION: Scenario title | HANDLING: What the system does
+Consider: login failures, missing data, records not found, processing errors,
+validation failures, timeout errors, network issues, application crashes.
+
+FORMAT (one per line, use | separator):
+EXCEPTION: Scenario title | HANDLING: What the system does (in third person, present tense)
+
+Example:
+EXCEPTION: Application Login Failure | HANDLING: The system retries login up to 3 times. If authentication fails, the system stops execution, captures a screenshot, and sends an error notification.
 
 TRANSCRIPT:
 {sample}
 
-EXCEPTIONS:"""
+OUTPUT:"""
 
     response = gemini_client.generate(
         prompt=prompt,
         system_prompt=get_system_prompt(),
-        call_name="ExceptionHandling"
+        call_name="ExceptionHandling_Fallback"
     )
     timed("Exceptions", start)
 
@@ -235,14 +228,14 @@ EXCEPTIONS:"""
     if not exceptions:
         exceptions = [
             {"exception": "Application Login Failure",
-             "handling": "Stop execution, log error, notify support."},
+             "handling": "The system retries login up to 3 times. If still failing, the system stops execution and sends an error notification."},
             {"exception": "Missing or Invalid Input Data",
-             "handling": "Log failure, skip affected record."},
+             "handling": "The system logs the validation failure, flags the affected record, and continues processing remaining items."},
             {"exception": "Record Not Found",
-             "handling": "Log details, skip, continue processing."},
-            {"exception": "Processing Error",
-             "handling": "Log error, mark failed, continue with others."},
+             "handling": "The system logs the missing record details, skips the entry, and continues with the next record."},
+            {"exception": "Application Timeout",
+             "handling": "The system waits for the configured timeout period, retries the operation, and logs the timeout event."},
             {"exception": "System Exception",
-             "handling": "Capture details in error log for audit."},
+             "handling": "The system captures error details, saves a screenshot, logs the exception, and terminates gracefully."},
         ]
     return exceptions

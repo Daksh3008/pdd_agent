@@ -19,16 +19,17 @@ from typing import Dict, List
 class GeminiConfig:
     """Google Gemini API configuration."""
     api_key: str = os.getenv("GEMINI_API_KEY", "")
-    
-    # Try the exact recommended strings for the new SDK
-    text_model: str = os.getenv("GEMINI_TEXT_MODEL", "gemini-2.5-flash") # If you enabled billing
-    # If no billing yet, try: "gemini-1.5-flash-latest" or "gemini-1.5-flash-8b"
-    
+    text_model: str = os.getenv("GEMINI_TEXT_MODEL", "gemini-2.5-flash")
     vision_model: str = os.getenv("GEMINI_VISION_MODEL", "gemini-2.5-flash")
 
-    # Rate limiting
-    requests_per_minute: int = int(os.getenv("GEMINI_RPM", "15"))
-    tokens_per_minute: int = int(os.getenv("GEMINI_TPM", "1000000"))
+    # Rate limiting — tuned for free tier (5-15 RPM)
+    requests_per_minute: int = int(os.getenv("GEMINI_RPM", "8"))
+    tokens_per_minute: int = int(os.getenv("GEMINI_TPM", "250000"))
+    requests_per_day: int = int(os.getenv("GEMINI_RPD", "1000"))
+
+    # Batching — consolidate calls
+    enable_batch_mode: bool = True
+
 
 # ============================================================
 # Whisper Configuration (audio pipeline only)
@@ -116,6 +117,24 @@ class FlowchartConfig:
     max_width_inches: float = 7.0
     font_name: str = "Arial"
     font_size: int = 11
+    max_label_words: int = 5
+
+
+# ============================================================
+# PII Redaction Configuration
+# ============================================================
+
+@dataclass
+class RedactionConfig:
+    """PII redaction settings."""
+    enabled: bool = True
+    redact_emails: bool = True
+    redact_phone_numbers: bool = True
+    redact_names: bool = True
+    redaction_placeholder: str = "[REDACTED]"
+    blur_radius: int = 25
+    redact_in_screenshots: bool = True
+    redact_in_text: bool = True
 
 
 # ============================================================
@@ -125,20 +144,20 @@ class FlowchartConfig:
 @dataclass
 class LLMParams:
     """Parameters for Gemini generation calls."""
-    temperature: float = 0.4
+    temperature: float = 0.3
     top_p: float = 0.85
-    max_output_tokens: int = 4096
+    max_output_tokens: int = 8192
 
     # Timeouts
     request_timeout: int = 120
 
-    # Prompt sizing
-    max_sample_text: int = 8000
-    max_sample_small: int = 3000
-    max_sample_entity: int = 4000
-    chunk_size: int = 5000
-    overlap_size: int = 200
-    max_chunks: int = 5
+    # Prompt sizing — larger chunks for fewer calls
+    max_sample_text: int = 15000
+    max_sample_small: int = 6000
+    max_sample_entity: int = 8000
+    chunk_size: int = 8000
+    overlap_size: int = 300
+    max_chunks: int = 3
 
     # Vision optimization (silent video pipeline)
     max_vision_calls: int = 15
@@ -147,8 +166,11 @@ class LLMParams:
     vision_calls_per_10_frames: int = 3
     absolute_max_vision_calls: int = 50
 
-    # Parallel workers
-    max_workers: int = 3
+    # Parallel workers — keep low for rate limit safety
+    max_workers: int = 1
+
+    # Step synthesis batching
+    step_batch_size: int = 8
 
 
 # ============================================================
@@ -266,6 +288,7 @@ class AppConfig:
     annotation: AnnotationConfig = field(default_factory=AnnotationConfig)
     image: ImageConfig = field(default_factory=ImageConfig)
     flowchart: FlowchartConfig = field(default_factory=FlowchartConfig)
+    redaction: RedactionConfig = field(default_factory=RedactionConfig)
     llm: LLMParams = field(default_factory=LLMParams)
     paths: PathConfig = field(default_factory=PathConfig)
 

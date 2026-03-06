@@ -4,15 +4,13 @@
 Audio Pipeline Orchestrator.
 Meeting recording (with audio) → Transcript → LLM → PDD Document.
 
-Flow:
-1. Extract audio from video (FFmpeg)
-2. Transcribe audio (Whisper)
-3. Extract entities & project name
-4. Generate document sections (purpose, overview, as-is, to-be)
-5. Extract process steps + detailed steps
-6. Generate flowchart
-7. Extract & match frames to steps
-8. Assemble PDD document
+Consolidated flow (3 LLM calls):
+1. Extract audio / use provided transcript
+2. LLM Call 1: Document sections
+3. LLM Call 2: Process steps & requirements
+4. LLM Call 3: DOT flowchart
+5. Extract frames & attach to steps
+6. Assemble PDD document
 """
 
 import os
@@ -23,25 +21,15 @@ from typing import Optional, List, Tuple, Dict
 from core.config import config
 from core.gemini_client import gemini_client
 from core.token_tracker import reset_tracker
-from core.utils import build_entity_hint
+from core.utils import build_entity_hint, redact_pii_from_image
 
 from audio.video_to_audio import convert_video_to_audio
 from audio.transcriber import transcribe_audio, read_transcript
 
-from llm_tasks.entity_extraction import extract_entities_and_project
-from llm_tasks.document_sections import (
-    get_document_purpose_text,
-    get_overview_and_justification,
-    get_as_is_process,
-    get_to_be_process
+from llm_tasks.meeting_compact import (
+    generate_doc_bundle_from_transcript,
+    generate_dot_from_transcript
 )
-from llm_tasks.process_steps import extract_process_steps, get_detailed_process_steps
-from llm_tasks.requirements import (
-    get_input_requirements,
-    get_interface_requirements,
-    get_exception_handling
-)
-from llm_tasks.flowchart_dot import generate_dot_and_apps
 
 from pipeline.common import (
     save_persistent_document, save_dot_code,
@@ -50,95 +38,207 @@ from pipeline.common import (
 )
 from document.pdd_generator import PDDGenerator
 
+
 class AudioPipeline:
-    """Pipeline for meeting recordings with audio."""
+    """Pipeline for meeting recordings with audio — consolidated LLM calls."""
 
     def __init__(self, output_dir: str = None):
         self.output_dir = output_dir or config.paths.output_dir
         os.makedirs(self.output_dir, exist_ok=True)
 
-    def _extract_candidate_frames(
-        self, video_path: str, transcript_path: str,
-        transcript: str, frames_dir: str, num_target: int
-    ) -> List[Tuple[str, str, float]]:
+    def _extract_evenly_spaced_frames(
+        self,
+        video_path: str,
+        frames_dir: str,
+        num_frames: int
+    ) -> List[Tuple[str, float]]:
         """
-        Extract a pool of candidate frames for step matching.
-        Returns list of (frame_path, transcript_text, timestamp) tuples.
+        Extract evenly spaced frames across the entire video.
+        Returns list of (frame_path, timestamp) tuples.
         """
-        from video.ocr_engine import OCR_AVAILABLE
+        import cv2
 
-        print(f"    Extracting candidate frame pool (target: {num_target * 3})...")
         os.makedirs(frames_dir, exist_ok=True)
-        candidates = []
-        used_timestamps = set()
-        pool_size = min(num_target * 3, 60)
 
-        # Source 1: Keyword-based from transcript
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print("    [Frames] Cannot open video")
+            return []
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = total_frames_count / fps if fps > 0 else 0
+
+        if duration <= 0:
+            cap.release()
+            print("    [Frames] Cannot determine video duration")
+            return []
+
+        print(f"    [Frames] Video: {duration:.0f}s, extracting {num_frames} frames...")
+
+        # Skip first 2% and last 2%
+        start_t = duration * 0.02
+        end_t = duration * 0.98
+        interval = (end_t - start_t) / (num_frames + 1)
+
+        frames = []
+        for i in range(num_frames):
+            timestamp = start_t + interval * (i + 1)
+            frame_idx = int(timestamp * fps)
+
+            if frame_idx >= total_frames_count:
+                continue
+
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+
+            if ret and frame is not None:
+                minutes = int(timestamp // 60)
+                seconds = int(timestamp % 60)
+                filename = f"frame_{i:03d}_{minutes}m{seconds:02d}s.jpg"
+                frame_path = os.path.join(frames_dir, filename)
+                cv2.imwrite(frame_path, frame)
+
+                # Redact PII
+                redact_pii_from_image(frame_path)
+
+                frames.append((frame_path, timestamp))
+
+        cap.release()
+        print(f"    [Frames] Extracted {len(frames)} frames")
+        return frames
+
+    def _extract_keyword_frames(
+        self,
+        video_path: str,
+        transcript_path: str,
+        frames_dir: str,
+        max_frames: int = 30
+    ) -> List[Tuple[str, float, str]]:
+        """
+        Extract frames at transcript action keyword timestamps.
+        Returns list of (frame_path, timestamp, transcript_text) tuples.
+        """
+        import cv2
+
+        os.makedirs(frames_dir, exist_ok=True)
+
+        # Parse transcript timestamps
+        lines = []
         try:
-            from audio.frame_extractor import (
-                extract_frames_with_transcripts,
-                extract_frame, get_video_duration
-            )
-
-            keyword_pairs = extract_frames_with_transcripts(
-                video_path, transcript_path, frames_dir
-            )
-            for fp, desc in keyword_pairs:
-                if len(candidates) < pool_size:
-                    candidates.append((fp, desc, -1))
+            with open(transcript_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    m = re.match(
+                        r'\[(\d+\.?\d*)\s*-\s*(\d+\.?\d*)\]\s+(.*)',
+                        line.strip()
+                    )
+                    if m:
+                        lines.append({
+                            "timestamp": float(m.group(1)),
+                            "text": m.group(3).strip()
+                        })
         except Exception as e:
-            print(f"    Keyword extraction error: {e}")
+            print(f"    [Frames] Error reading transcript: {e}")
+            return []
 
-        # Source 2: Evenly spaced to fill pool
-        remaining = pool_size - len(candidates)
-        if remaining > 0:
-            try:
-                from audio.frame_extractor import (
-                    extract_frame, get_video_duration
-                )
-                print(f"    Source 2: {remaining} evenly-spaced frames...")
-                duration = get_video_duration(video_path)
-                if duration > 0:
-                    start_t = duration * 0.02
-                    end_t = duration * 0.98
-                    interval = (end_t - start_t) / (remaining + 1)
+        if not lines:
+            return []
 
-                    # Build transcript lookup
-                    transcript_lookup = {}
-                    try:
-                        with open(transcript_path, 'r', encoding='utf-8') as f:
-                            for line in f:
-                                m = re.match(
-                                    r'\[(\d+\.?\d*)\s*-\s*(\d+\.?\d*)\]\s+(.*)',
-                                    line.strip()
-                                )
-                                if m:
-                                    transcript_lookup[float(m.group(1))] = (
-                                        m.group(3).strip()
-                                    )
-                    except Exception:
-                        pass
+        # Find action keyword timestamps
+        from core.config import ACTION_KEYWORDS
+        all_kw = set()
+        for kl in ACTION_KEYWORDS.values():
+            for kw in kl:
+                all_kw.add(kw.lower())
 
-                    for i in range(remaining):
-                        ts = start_t + interval * (i + 1)
-                        if any(abs(ts - used) < 1.5 for used in used_timestamps):
-                            ts += interval * 0.3
-                        fp = extract_frame(video_path, ts, frames_dir)
-                        if fp:
-                            closest_text = ""
-                            min_diff = float('inf')
-                            for t_ts, t_text in transcript_lookup.items():
-                                diff = abs(t_ts - ts)
-                                if diff < min_diff:
-                                    min_diff = diff
-                                    closest_text = t_text
-                            candidates.append((fp, closest_text, ts))
-                            used_timestamps.add(ts)
-            except Exception as e:
-                print(f"    Evenly-spaced extraction error: {e}")
+        action_lines = []
+        for tl in lines:
+            if any(kw in tl["text"].lower() for kw in all_kw):
+                action_lines.append(tl)
 
-        print(f"    Total candidate frames: {len(candidates)}")
-        return candidates
+        if not action_lines:
+            return []
+
+        # Deduplicate close timestamps (min 3s apart)
+        deduped = [action_lines[0]]
+        for al in action_lines[1:]:
+            if al["timestamp"] - deduped[-1]["timestamp"] > 3.0:
+                deduped.append(al)
+
+        # Limit
+        if len(deduped) > max_frames:
+            step = len(deduped) // max_frames
+            deduped = deduped[::step][:max_frames]
+
+        # Extract frames
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return []
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frames = []
+
+        for i, al in enumerate(deduped):
+            ts = al["timestamp"]
+            cap.set(cv2.CAP_PROP_POS_MSEC, ts * 1000)
+            ret, frame = cap.read()
+
+            if ret and frame is not None:
+                minutes = int(ts // 60)
+                seconds = int(ts % 60)
+                filename = f"frame_kw_{i:03d}_{minutes}m{seconds:02d}s.jpg"
+                frame_path = os.path.join(frames_dir, filename)
+                cv2.imwrite(frame_path, frame)
+
+                redact_pii_from_image(frame_path)
+                frames.append((frame_path, ts, al["text"]))
+
+        cap.release()
+        print(f"    [Frames] Extracted {len(frames)} keyword frames from {len(deduped)} timestamps")
+        return frames
+
+    def _assign_frames_to_steps(
+        self,
+        frames: List[Tuple[str, float]],
+        detailed_dicts: List[Dict],
+    ) -> Dict[str, str]:
+        """
+        Assign frames to detailed steps by distributing evenly.
+        Returns dict of {step_number_str: frame_path}.
+
+        Simple chronological assignment: spread N frames across M steps.
+        """
+        if not frames or not detailed_dicts:
+            return {}
+
+        num_steps = len(detailed_dicts)
+        num_frames = len(frames)
+
+        # Sort frames by timestamp
+        sorted_frames = sorted(frames, key=lambda x: x[1])
+
+        assigned = {}
+
+        if num_frames >= num_steps:
+            # More frames than steps: pick evenly spaced frames
+            for i, step in enumerate(detailed_dicts):
+                frame_idx = int(i * num_frames / num_steps)
+                frame_idx = min(frame_idx, num_frames - 1)
+                step_num = step.get("number", f"2.4.{i+1}")
+                assigned[str(step_num)] = sorted_frames[frame_idx][0]
+        else:
+            # Fewer frames than steps: assign frames to first N steps,
+            # then spread remaining steps without frames
+            interval = max(1, num_steps // num_frames)
+            frame_idx = 0
+            for i, step in enumerate(detailed_dicts):
+                if frame_idx < num_frames and (i % interval == 0 or i == 0):
+                    step_num = step.get("number", f"2.4.{i+1}")
+                    assigned[str(step_num)] = sorted_frames[frame_idx][0]
+                    frame_idx += 1
+
+        print(f"    [Frames] Assigned {len(assigned)} frames to {num_steps} steps")
+        return assigned
 
     def process(
         self,
@@ -154,7 +254,7 @@ class AudioPipeline:
             video_path: Path to video file.
             project_name: Optional project name (auto-detected if None).
             whisper_model: Whisper model size override.
-            transcript_path: Pre-existing transcript path (skips transcription).
+            transcript_path: Pre-existing transcript (skips Whisper).
 
         Returns:
             Path to generated document, or None on failure.
@@ -164,25 +264,26 @@ class AudioPipeline:
         gemini_client.set_tracker(tracker)
 
         print_pipeline_header(
-            "Meeting Recording (Audio)",
+            "Meeting Recording (Audio) — Consolidated",
             video_path=video_path,
             project_name=project_name or "(auto-detect)",
-            extra_info={"OCR": "Available" if self._ocr_available() else "Not available"}
+            extra_info={
+                "Mode": "Consolidated (3 LLM calls)",
+            }
         )
 
         if not os.path.exists(video_path):
             print(f"Error: {video_path} not found")
             return None
 
-        # ── Step 1: Transcript ──
+        # ── Step 1: Get Transcript ──
         if transcript_path and os.path.exists(transcript_path):
-            print(f"\n[1/6] Using existing transcript: {transcript_path}")
+            print(f"\n[1/4] Using provided transcript: {transcript_path}")
         else:
-            print("\n[1/6] Extracting audio...")
+            print("\n[1/4] Extracting audio and transcribing...")
             audio = convert_video_to_audio(video_path, self.output_dir)
             if not audio:
                 return None
-            print("[1/6] Transcribing...")
             transcript_path = transcribe_audio(
                 audio, self.output_dir,
                 model_name=whisper_model or config.whisper.model_name
@@ -195,129 +296,141 @@ class AudioPipeline:
             return None
         print(f"  Transcript: {len(transcript):,} chars")
 
-        # ── Step 2: LLM Extraction ──
-        print("\n[2/6] LLM extraction...")
-
+        # ── Step 2: Consolidated LLM Calls (2 calls) ──
+        print("\n[2/4] Consolidated LLM extraction (2 calls)...")
         t = time.time()
-        entities, detected = extract_entities_and_project(transcript)
+
+        bundle = generate_doc_bundle_from_transcript(
+            transcript, project_name_hint=project_name
+        )
+
         if not project_name:
-            project_name = detected
-        eh = build_entity_hint(entities)
-        print(f"  ✓ Project: {project_name} ({time.time()-t:.0f}s)")
+            project_name = bundle["project_name"]
 
+        doc = bundle["document"]
+        proc = bundle["process"]
+        reqs = bundle["requirements"]
+        entities = bundle["entities"]
+
+        process_steps = proc.get("process_steps", [])
+        detailed_steps = proc.get("detailed_steps", [])
+
+        print(f"  Project: {project_name}")
+        print(f"  Purpose: {len(doc.get('purpose', ''))} chars")
+        print(f"  Overview: {len(doc.get('overview', ''))} chars")
+        print(f"  As-Is: {len(doc.get('as_is', ''))} chars")
+        print(f"  To-Be: {len(doc.get('to_be', ''))} chars")
+        print(f"  Process steps: {len(process_steps)}")
+        print(f"  Detailed steps: {len(detailed_steps)}")
+        print(f"  Inputs: {len(reqs.get('input_requirements', []))}")
+        print(f"  Interfaces: {len(reqs.get('interface_requirements', []))}")
+        print(f"  Exceptions: {len(reqs.get('exception_handling', []))}")
+        print(f"  ({time.time()-t:.0f}s)")
+
+        # ── Step 3: Flowchart + Frame Extraction ──
+        print("\n[3/4] Flowchart & screenshots...")
+
+        # DOT flowchart
         t = time.time()
-        purpose = get_document_purpose_text(transcript, project_name, eh)
-        print(f"  ✓ Purpose ({time.time()-t:.0f}s)")
-
-        t = time.time()
-        ov_just = get_overview_and_justification(transcript, project_name, eh)
-        print(f"  ✓ Overview+Justification ({time.time()-t:.0f}s)")
-
-        t = time.time()
-        as_is = get_as_is_process(transcript, project_name, eh)
-        print(f"  ✓ As-Is ({time.time()-t:.0f}s)")
-
-        t = time.time()
-        to_be = get_to_be_process(transcript, project_name, eh)
-        print(f"  ✓ To-Be ({time.time()-t:.0f}s)")
-
-        # ── Step 3: Process Steps ──
-        print("\n[3/6] Extracting steps...")
-
-        t = time.time()
-        steps = extract_process_steps(transcript, entities)
-        print(f"  ✓ {len(steps)} process steps ({time.time()-t:.0f}s)")
-        for i, s in enumerate(steps[:5]):
-            print(f"    {i+1}. {s}")
-        if len(steps) > 5:
-            print(f"    ... +{len(steps)-5} more")
-
-        t = time.time()
-        detailed = get_detailed_process_steps(transcript, project_name, eh)
-        print(f"  ✓ {len(detailed)} detailed steps ({time.time()-t:.0f}s)")
-
-        t = time.time()
-        input_reqs = get_input_requirements(transcript, project_name, eh)
-        print(f"  ✓ {len(input_reqs)} inputs ({time.time()-t:.0f}s)")
-
-        t = time.time()
-        exceptions = get_exception_handling(transcript, project_name, eh)
-        print(f"  ✓ {len(exceptions)} exceptions ({time.time()-t:.0f}s)")
-
-        t = time.time()
-        dot_code, apps = generate_dot_and_apps(steps, transcript, entities)
-        print(f"  ✓ {len(apps)} interfaces ({time.time()-t:.0f}s)")
-
-        # ── Step 4: Flowchart ──
-        print("\n[4/6] Flowchart...")
+        dot_code = generate_dot_from_transcript(
+            transcript, project_name, process_steps
+        )
         if dot_code:
             save_dot_code(dot_code, project_name, self.output_dir)
         fc_path = generate_flowchart(dot_code, self.output_dir, project_name)
+        print(f"  Flowchart ({time.time()-t:.0f}s)")
 
-        # ── Step 5: Screenshots + Matching ──
-        print("\n[5/6] Screenshots & matching...")
-        matched_frames = []
+        # Build detailed step dicts
+        detailed_dicts = [
+            {"number": f"2.4.{i+1}", "description": s}
+            for i, s in enumerate(detailed_steps)
+        ]
 
-        if os.path.exists(video_path) and detailed:
-            try:
-                from video.frame_matcher import match_pipeline, build_candidates
-                from video.ocr_engine import OCR_AVAILABLE
+        # Extract frames
+        frames_dir = os.path.join(self.output_dir, "frames")
+        all_frames = []  # List of (path, timestamp)
 
-                num_steps = len(detailed)
-                raw_candidates = self._extract_candidate_frames(
-                    video_path, transcript_path, transcript,
-                    os.path.join(self.output_dir, "frames"),
-                    num_target=num_steps
+        if os.path.exists(video_path) and detailed_dicts:
+            t = time.time()
+
+            # Strategy 1: Keyword frames from transcript
+            if transcript_path and os.path.exists(transcript_path):
+                kw_frames = self._extract_keyword_frames(
+                    video_path, transcript_path, frames_dir,
+                    max_frames=min(len(detailed_dicts) * 2, 50)
                 )
+                for fp, ts, _ in kw_frames:
+                    all_frames.append((fp, ts))
 
-                if raw_candidates:
-                    frame_pairs = [(fp, desc) for fp, desc, _ in raw_candidates]
-                    timestamps = [ts for _, _, ts in raw_candidates]
-                    candidates = build_candidates(frame_pairs, timestamps)
+            # Strategy 2: Fill with evenly spaced frames
+            target_total = max(len(detailed_dicts), 15)
+            remaining_needed = target_total - len(all_frames)
 
-                    print(f"  Running frame matcher "
-                          f"({'with OCR' if OCR_AVAILABLE else 'transcript-only'})...")
-                    matched_frames = match_pipeline(
-                        candidates, detailed, run_ocr=OCR_AVAILABLE
-                    )
-            except Exception as e:
-                print(f"  Frame matching error: {e}")
+            if remaining_needed > 0:
+                even_frames = self._extract_evenly_spaced_frames(
+                    video_path, frames_dir, num_frames=remaining_needed
+                )
+                # Only add frames that aren't too close to existing ones
+                existing_timestamps = set(ts for _, ts in all_frames)
+                for fp, ts in even_frames:
+                    if not any(abs(ts - et) < 2.0 for et in existing_timestamps):
+                        all_frames.append((fp, ts))
+                        existing_timestamps.add(ts)
 
-        # ── Step 6: Generate Document ──
-        print("\n[6/6] Generating document...")
+            print(f"  Total frames extracted: {len(all_frames)} ({time.time()-t:.0f}s)")
 
-        # Convert steps list to dicts for document
+            # Assign frames to steps
+            step_frame_map = self._assign_frames_to_steps(all_frames, detailed_dicts)
+
+            # Update detailed_dicts with frame paths
+            for step in detailed_dicts:
+                step_num = step.get("number", "")
+                frame_path = step_frame_map.get(str(step_num), "")
+                if frame_path:
+                    step["frame_after_path"] = frame_path
+
+        # ── Step 4: Generate Document ──
+        print("\n[4/4] Generating document...")
+
         process_steps_dicts = None
-        if steps:
+        if process_steps:
             process_steps_dicts = [
-                {"number": i + 1, "description": s} for i, s in enumerate(steps)
+                {"number": i + 1, "description": s}
+                for i, s in enumerate(process_steps)
             ]
+
+        # Build annotated_frames dict for the generator
+        annotated_frames = {}
+        for step in detailed_dicts:
+            step_num = step.get("number", "")
+            frame_path = step.get("frame_after_path", "")
+            if frame_path and os.path.exists(frame_path):
+                # Extract numeric part for dict key
+                try:
+                    num_key = int(str(step_num).split('.')[-1])
+                    annotated_frames[num_key] = frame_path
+                except (ValueError, IndexError):
+                    pass
+
+        if annotated_frames:
+            print(f"  {len(annotated_frames)} frames will be embedded in document")
 
         doc_path = build_document(
             project_name=project_name,
             output_dir=self.output_dir,
-            purpose=purpose,
-            overview=ov_just.get("overview", ""),
-            justification=ov_just.get("justification", ""),
-            as_is=as_is,
-            to_be=to_be,
+            purpose=doc.get("purpose", ""),
+            overview=doc.get("overview", ""),
+            justification=doc.get("justification", ""),
+            as_is=doc.get("as_is", ""),
+            to_be=doc.get("to_be", ""),
             process_steps=process_steps_dicts,
-            input_requirements=input_reqs,
-            detailed_steps=detailed,
-            interface_requirements=apps,
-            exception_handling=exceptions,
+            input_requirements=reqs.get("input_requirements", []),
+            detailed_steps=detailed_dicts,
+            interface_requirements=reqs.get("interface_requirements", []),
+            exception_handling=reqs.get("exception_handling", []),
             flowchart_path=fc_path,
+            annotated_frames=annotated_frames,
         )
-
-        # Append screenshots if matched
-        if matched_frames:
-            valid_frames = [
-                (p, d) for p, d in matched_frames if p and os.path.exists(p)
-            ]
-            if valid_frames:
-                print(f"  Adding {len(valid_frames)} screenshots to Section 2.4...")
-                gen = PDDGenerator()
-                gen.append_frames_with_text(doc_path, valid_frames, detailed_steps=detailed)
 
         persistent = save_persistent_document(doc_path, project_name)
 
@@ -329,95 +442,11 @@ class AudioPipeline:
         print_pipeline_footer(
             persistent, project_name,
             {
-                "Steps": len(steps),
-                "Detailed": len(detailed),
-                "Frames": len(matched_frames)
+                "Steps": len(process_steps),
+                "Detailed": len(detailed_steps),
+                "Frames embedded": len(annotated_frames),
+                "LLM Calls": len(tracker.calls)
             },
-            total
-        )
-        return doc_path
-
-    def process_transcript_only(
-        self,
-        transcript_path: str,
-        project_name: str = None,
-        video_path: str = None
-    ) -> Optional[str]:
-        """Process transcript only — reuses full pipeline if video is provided."""
-        if video_path and os.path.exists(video_path):
-            return self.process(
-                video_path, project_name, transcript_path=transcript_path
-            )
-
-        t0 = time.time()
-        tracker = reset_tracker()
-        gemini_client.set_tracker(tracker)
-
-        print_pipeline_header("Transcript Only", project_name=project_name or "(auto-detect)")
-
-        if not os.path.exists(transcript_path):
-            print(f"Error: {transcript_path} not found")
-            return None
-
-        transcript = read_transcript(transcript_path)
-        if not transcript:
-            return None
-
-        entities, detected = extract_entities_and_project(transcript)
-        if not project_name:
-            project_name = detected
-        eh = build_entity_hint(entities)
-
-        purpose = get_document_purpose_text(transcript, project_name, eh)
-        ov_just = get_overview_and_justification(transcript, project_name, eh)
-        as_is = get_as_is_process(transcript, project_name, eh)
-        to_be = get_to_be_process(transcript, project_name, eh)
-        steps = extract_process_steps(transcript, entities)
-        detailed = get_detailed_process_steps(transcript, project_name, eh)
-        input_reqs = get_input_requirements(transcript, project_name, eh)
-        exceptions = get_exception_handling(transcript, project_name, eh)
-        dot_code, apps = generate_dot_and_apps(steps, transcript, entities)
-
-        if dot_code:
-            save_dot_code(dot_code, project_name, self.output_dir)
-        fc_path = generate_flowchart(dot_code, self.output_dir, project_name)
-
-        process_steps_dicts = None
-        if steps:
-            process_steps_dicts = [
-                {"number": i + 1, "description": s} for i, s in enumerate(steps)
-            ]
-
-        doc_path = build_document(
-            project_name=project_name,
-            output_dir=self.output_dir,
-            purpose=purpose,
-            overview=ov_just.get("overview", ""),
-            justification=ov_just.get("justification", ""),
-            as_is=as_is,
-            to_be=to_be,
-            process_steps=process_steps_dicts,
-            input_requirements=input_reqs,
-            detailed_steps=detailed,
-            interface_requirements=apps,
-            exception_handling=exceptions,
-            flowchart_path=fc_path,
-        )
-
-        if detailed:
-            from document.pdd_generator import PDDGenerator
-            gen = PDDGenerator()
-            gen.append_frames_with_text(doc_path, [], detailed_steps=detailed)
-
-        persistent = save_persistent_document(doc_path, project_name)
-
-        tracker.print_report()
-        tracker.save_csv(project_name)
-
-        total = time.time() - t0
-        print_pipeline_footer(
-            persistent, project_name,
-            {"Steps": len(steps), "Detailed": len(detailed)},
             total
         )
         return doc_path

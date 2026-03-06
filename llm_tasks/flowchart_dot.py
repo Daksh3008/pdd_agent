@@ -1,10 +1,12 @@
-# llm/flowchart_dot.py
+# llm_tasks/flowchart_dot.py
 
 """
 DOT flowchart code generation.
 Two approaches:
-1. From transcript (audio pipeline) - classify and generate
-2. From PDD steps (video pipeline) - direct step-to-node mapping
+1. From transcript (audio pipeline) — uses meeting_compact
+2. From PDD steps (video pipeline) — deterministic step-to-node mapping
+
+All labels enforced to max 5 words.
 """
 
 import re
@@ -75,18 +77,35 @@ def classify_steps(steps: List[str]) -> List[Dict]:
     return classified
 
 
-def _shorten_label(text: str, max_words: int = 6) -> str:
-    """Shorten step text to a flowchart-friendly label."""
+def _shorten_label(text: str, max_words: int = None) -> str:
+    """
+    Shorten step text to a flowchart-friendly label.
+    Max 5 words, verb+object format.
+    """
+    max_words = max_words or config.flowchart.max_label_words
+
+    # Remove common prefixes
     text = re.sub(
-        r'^(the system|the automation|the bot|the solution|it)\s+',
+        r'^(the system|the automation|the bot|the solution|the process|it)\s+',
         '', text, flags=re.IGNORECASE
     ).strip()
+
+    # Remove filler words
+    text = re.sub(
+        r'\b(the|a|an|to|of|for|in|on|at|by|with|using|based|upon|into)\b',
+        ' ', text, flags=re.IGNORECASE
+    )
+    text = re.sub(r'\s+', ' ', text).strip()
     text = text.rstrip('.')
+
+    # Capitalize first letter
     if text:
         text = text[0].upper() + text[1:]
+
     words = text.split()
     if len(words) > max_words:
-        text = ' '.join(words[:max_words]) + '...'
+        text = ' '.join(words[:max_words])
+
     return text
 
 
@@ -143,17 +162,13 @@ def generate_flowchart_dot_from_steps(
     if not pdd_steps:
         return ""
 
-    # Extract step descriptions
     descriptions = [s.get("description", "") for s in pdd_steps]
-    
-    # Classify
     classified = classify_steps(descriptions[:20])
 
     if not classified:
         timed("Flowchart", start)
         return ""
 
-    # Determine layout based on step count
     num_steps = len(classified)
     if num_steps > 20:
         rankdir = "LR"
@@ -197,7 +212,8 @@ def _deterministic_dot(
         step_type = c["type"]
         label = c["short_label"].replace('"', '\\"')
 
-        if len(label) > 30:
+        # Wrap long labels (over 20 chars)
+        if len(label) > 20:
             words = label.split()
             mid = len(words) // 2
             label = ' '.join(words[:mid]) + '\\n' + ' '.join(words[mid:])
@@ -272,11 +288,8 @@ def _deterministic_dot(
 
 
 def _make_question(label: str) -> str:
-    """Convert a statement label into a question for decision diamonds."""
-    label = label.rstrip('.')
-
-    if label.endswith('?'):
-        return label
+    """Convert a statement label into a short question for decision diamonds."""
+    label = label.rstrip('.').rstrip('?')
 
     lower = label.lower()
     if 'valid' in lower:
@@ -297,8 +310,13 @@ def _make_question(label: str) -> str:
         return 'Matches?'
     if 'approv' in lower:
         return 'Approved?'
+    if 'complet' in lower:
+        return 'Complete?'
+    if 'available' in lower:
+        return 'Available?'
 
+    # Shorten to max 3 words + "?"
     words = label.split()
-    if len(words) > 4:
-        label = ' '.join(words[:4])
+    if len(words) > 3:
+        label = ' '.join(words[:3])
     return label + '?'

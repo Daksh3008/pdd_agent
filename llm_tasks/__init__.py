@@ -1,4 +1,4 @@
-# llm/__init__.py
+# llm_tasks/__init__.py
 
 """
 LLM tasks module.
@@ -13,13 +13,7 @@ from llm_tasks.system_prompts import (
     get_system_prompt
 )
 from llm_tasks.entity_extraction import extract_entities_and_project
-from llm_tasks.document_sections import (
-    get_document_purpose_text,
-    get_overview_and_justification,
-    get_as_is_process,
-    get_to_be_process,
-    generate_all_sections_parallel
-)
+from llm_tasks.document_sections import generate_all_sections_parallel
 from llm_tasks.process_steps import extract_process_steps, get_detailed_process_steps
 from llm_tasks.requirements import (
     get_input_requirements,
@@ -35,3 +29,7 @@ from llm_tasks.vision_describer import (
     identify_application
 )
 from llm_tasks.step_synthesizer import synthesize_pdd_steps
+from llm_tasks.meeting_compact import (
+    generate_doc_bundle_from_transcript,
+    generate_dot_from_transcript
+)

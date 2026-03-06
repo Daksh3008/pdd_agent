@@ -1,8 +1,9 @@
-# llm/timestamps.py
+# llm_tasks/timestamps.py
 
 """
 Key timestamp identification and description paraphrasing.
 Used by the audio pipeline to identify action moments in transcript.
+Kept for frame extraction support.
 """
 
 import re
@@ -11,7 +12,7 @@ from typing import Dict, List
 
 from core.gemini_client import gemini_client
 from core.config import ACTION_KEYWORDS
-from core.utils import timed, parse_numbered_steps
+from core.utils import timed, parse_numbered_steps, redact_pii_text
 from llm_tasks.system_prompts import get_system_prompt
 
 
@@ -21,7 +22,7 @@ def identify_key_timestamps(
 ) -> List[Dict]:
     """
     Identify key action timestamps from transcript.
-    Uses LLM to classify which transcript lines show process actions.
+    Uses keyword matching (no LLM call needed) to save API quota.
     """
     start = time.time()
     lines = []
@@ -45,59 +46,19 @@ def identify_key_timestamps(
     if not lines:
         return []
 
-    # Sample lines for LLM analysis
-    step = max(1, len(lines) // 20)
-    sampled = lines[::step][:20]
-    text = "\n".join(
-        [f"[{l['timestamp']:.1f}] {l['text']}" for l in sampled]
-    )
-
-    prompt = f"""Which lines show a PROCESS ACTION (opening app, clicking, typing, navigating)?
-NOT: talking, explaining, greeting.
-
-Per line respond: [time] YES action  OR  [time] NO
-
-{text}
-
-Answers:"""
-
-    response = gemini_client.generate(
-        prompt=prompt,
-        call_name="KeyTimestamps"
-    )
+    # Keyword matching (no LLM call — saves API quota)
+    all_kw = set()
+    for kl in ACTION_KEYWORDS.values():
+        for kw in kl:
+            all_kw.add(kw.lower())
 
     moments = []
-    if response:
-        for line in response.split('\n'):
-            m = re.search(
-                r'\[?(\d+\.?\d*)\]?\s*YES\s*[-:.]?\s*(.*)',
-                line, re.IGNORECASE
-            )
-            if m:
-                ts = float(m.group(1))
-                desc = m.group(2).strip()
-                if not desc:
-                    for sl in sampled:
-                        if abs(sl["timestamp"] - ts) < 1.0:
-                            desc = sl["text"]
-                            break
-                moments.append({
-                    "timestamp": ts,
-                    "description": desc or "Process action"
-                })
-
-    # Fallback: keyword matching
-    if len(moments) < 3:
-        all_kw = set()
-        for kl in ACTION_KEYWORDS.values():
-            for kw in kl:
-                all_kw.add(kw.lower())
-        for tl in lines:
-            if any(kw in tl["text"].lower() for kw in all_kw):
-                moments.append({
-                    "timestamp": tl["timestamp"],
-                    "description": tl["text"]
-                })
+    for tl in lines:
+        if any(kw in tl["text"].lower() for kw in all_kw):
+            moments.append({
+                "timestamp": tl["timestamp"],
+                "description": redact_pii_text(tl["text"])
+            })
 
     # Deduplicate close timestamps
     if moments:
@@ -107,10 +68,10 @@ Answers:"""
                 deduped.append(km)
         moments = deduped
 
-    # Limit to 15
-    if len(moments) > 15:
-        s = len(moments) // 15
-        moments = moments[::s][:15]
+    # Limit
+    if len(moments) > 20:
+        s = len(moments) // 20
+        moments = moments[::s][:20]
 
     timed(f"Timestamps ({len(moments)})", start)
     return moments
@@ -118,11 +79,11 @@ Answers:"""
 
 def paraphrase_batch(
     texts: List[str],
-    batch_size: int = 5
+    batch_size: int = 8
 ) -> List[str]:
     """
     Paraphrase frame descriptions into professional process steps.
-    Used to improve raw OCR/transcript descriptions.
+    Larger batch size to reduce API calls.
     """
     if not texts:
         return []
@@ -132,16 +93,20 @@ def paraphrase_batch(
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i + batch_size]
         numbered = "\n".join(
-            [f"{j+1}. {t[:100]}" for j, t in enumerate(batch)]
+            [f"{j+1}. {t[:120]}" for j, t in enumerate(batch)]
         )
 
-        prompt = f"""Rewrite each as a professional process step description.
-What the SYSTEM does at this point. Third person, 1 sentence each.
-Use ONLY names from the original text.
+        prompt = f"""Rewrite each description as a professional PDD process step.
+
+RULES:
+- Each step describes what THE SYSTEM does.
+- Third person, present tense, active voice.
+- 1 sentence each, starting with "The system..."
+- NEVER include personal names or email addresses.
 
 {numbered}
 
-Rewritten:
+OUTPUT (numbered list only):
 1."""
 
         response = gemini_client.generate(
@@ -158,8 +123,8 @@ Rewritten:
 
         for j in range(len(batch)):
             if j < len(batch_results):
-                results.append(batch_results[j])
+                results.append(redact_pii_text(batch_results[j]))
             else:
-                results.append(batch[j][:120])
+                results.append(redact_pii_text(batch[j][:120]))
 
     return results

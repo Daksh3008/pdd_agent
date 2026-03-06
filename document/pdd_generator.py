@@ -4,9 +4,11 @@
 PDD/BRD Document Generator.
 Unified DOCX generator used by both audio and video pipelines.
 Supports flowchart insertion, screenshot annotation, and detailed steps.
+Strips all markdown formatting before inserting into DOCX.
 """
 
 import os
+import re
 from typing import List, Dict, Optional, Tuple
 
 from docx import Document
@@ -17,6 +19,60 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
 from core.config import config
+
+
+def _strip_markdown_for_docx(text: str) -> str:
+    """Remove all markdown formatting before inserting into DOCX."""
+    if not text:
+        return text
+    text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
+    text = re.sub(r'__([^_]+)__', r'\1', text)
+    text = re.sub(r'(?<!\*)\*([^*]+)\*(?!\*)', r'\1', text)
+    text = re.sub(r'(?<!_)_([^_]+)_(?!_)', r'\1', text)
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'```[^`]*```', '', text, flags=re.DOTALL)
+    text = re.sub(r'`([^`]+)`', r'\1', text)
+    return text
+
+
+def _resolve_step_number(step_num, annotated_frames: Dict) -> str:
+    """
+    Try multiple key formats to find a frame in annotated_frames.
+    step_num could be: "2.4.1", 1, "1", etc.
+    annotated_frames keys could be: 1, "1", "2.4.1", etc.
+    """
+    if not annotated_frames:
+        return ""
+
+    # Direct lookup
+    if step_num in annotated_frames:
+        return annotated_frames[step_num]
+
+    # Try string version
+    str_num = str(step_num)
+    if str_num in annotated_frames:
+        return annotated_frames[str_num]
+
+    # Extract trailing integer from "2.4.X"
+    if isinstance(step_num, str) and '.' in step_num:
+        try:
+            num_key = int(step_num.split('.')[-1])
+            if num_key in annotated_frames:
+                return annotated_frames[num_key]
+            if str(num_key) in annotated_frames:
+                return annotated_frames[str(num_key)]
+        except (ValueError, IndexError):
+            pass
+
+    # Try int conversion
+    try:
+        int_key = int(step_num)
+        if int_key in annotated_frames:
+            return annotated_frames[int_key]
+    except (ValueError, TypeError):
+        pass
+
+    return ""
 
 
 class PDDGenerator:
@@ -51,6 +107,7 @@ class PDDGenerator:
         r.font.color.rgb = RGBColor.from_string(color)
 
     def _para(self, text, after=8):
+        text = _strip_markdown_for_docx(text)
         p = self.doc.add_paragraph(text)
         p.paragraph_format.space_after = Pt(after)
         return p
@@ -69,7 +126,7 @@ class PDDGenerator:
         for ri, rd in enumerate(data):
             for ci, ct in enumerate(rd):
                 cell = t.cell(ri, ci)
-                cell.text = str(ct)
+                cell.text = _strip_markdown_for_docx(str(ct))
                 for p in cell.paragraphs:
                     p.paragraph_format.space_before = Pt(3)
                     p.paragraph_format.space_after = Pt(3)
@@ -116,12 +173,56 @@ class PDDGenerator:
             self._para("[Flowchart could not be inserted]")
             return
 
-        # Caption
         p = self.doc.add_paragraph()
         p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
         r = p.add_run(f"Figure 1: {project_name} Process Flow")
         r.italic = True
         r.font.size = Pt(10)
+
+    def _add_multiline_content(self, text: str):
+        """Add multi-line text content, handling paragraphs and bullet points."""
+        if not text:
+            return
+
+        text = _strip_markdown_for_docx(text)
+
+        for para in text.split('\n'):
+            para = para.strip()
+            if not para:
+                continue
+
+            is_bullet = para.startswith(('- ', '• ', '* '))
+            if is_bullet:
+                para = para.lstrip('-•* ').strip()
+                self._para(f"  •  {para}", after=3)
+            elif re.match(r'^\d+[\.\)]\s', para):
+                self._para(f"  {para}", after=3)
+            else:
+                self._para(para, after=8)
+
+    def _add_screenshot(self, frame_path: str, step_num: str = ""):
+        """Add a screenshot image to the document."""
+        if not frame_path or not os.path.exists(frame_path):
+            return False
+
+        try:
+            self.doc.add_picture(frame_path, width=Inches(5.5))
+            last_p = self.doc.paragraphs[-1]
+            last_p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+            last_p.paragraph_format.space_after = Pt(10)
+
+            # Add caption
+            cap_p = self.doc.add_paragraph()
+            cap_p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+            cap_r = cap_p.add_run(f"Screenshot — Step {step_num}")
+            cap_r.italic = True
+            cap_r.font.size = Pt(9)
+            cap_r.font.color.rgb = RGBColor(120, 120, 120)
+
+            return True
+        except Exception as e:
+            print(f"    [PDDDoc] Could not add image for step {step_num}: {e}")
+            return False
 
     def generate(
         self,
@@ -139,9 +240,11 @@ class PDDGenerator:
         exception_handling: List[Dict] = None,
         flowchart_path: str = "",
         output_path: str = "PDD.docx",
-        annotated_frames: Dict[int, str] = None
+        annotated_frames: Dict = None
     ) -> str:
         """Generate complete PDD/BRD document."""
+
+        annotated_frames = annotated_frames or {}
 
         doc_type = config.document.document_type
         doc_type_full = config.document.document_type_full
@@ -228,9 +331,7 @@ class PDDGenerator:
 
         self._heading("1.1  PURPOSE OF THIS DOCUMENT", 2)
         if document_purpose:
-            for para in document_purpose.split('\n\n'):
-                if para.strip():
-                    self._para(para.strip())
+            self._add_multiline_content(document_purpose)
         else:
             self._para(
                 f"This document defines the requirements for the "
@@ -239,13 +340,7 @@ class PDDGenerator:
 
         self._heading("1.2  OVERVIEW AND OBJECTIVE", 2)
         if overview:
-            for line in overview.split('\n'):
-                line = line.strip()
-                if line:
-                    self._para(
-                        line,
-                        after=3 if line.startswith(('•', '-', '*')) else 8
-                    )
+            self._add_multiline_content(overview)
         else:
             self._para(
                 f"The primary objective is to automate the "
@@ -254,9 +349,7 @@ class PDDGenerator:
 
         self._heading("1.3  BUSINESS JUSTIFICATION", 2)
         if justification:
-            for line in justification.split('\n'):
-                if line.strip():
-                    self._para(line.strip())
+            self._add_multiline_content(justification)
         else:
             self._para(f"The {project_name} delivers operational efficiency.")
 
@@ -268,9 +361,7 @@ class PDDGenerator:
         # 2.1 As-Is
         self._heading("2.1  \"AS IS\" PROCESS", 2)
         if as_is:
-            for line in as_is.split('\n'):
-                if line.strip():
-                    self._para(line.strip())
+            self._add_multiline_content(as_is)
         else:
             self._para("Current manual process to be documented.")
 
@@ -279,14 +370,11 @@ class PDDGenerator:
         # 2.2 To-Be
         self._heading("2.2  \"TO BE\" PROCESS (AUTOMATED STATE)", 2)
         if to_be:
-            for para in to_be.split('\n\n'):
-                if para.strip():
-                    self._para(para.strip())
+            self._add_multiline_content(to_be)
 
         # 2.2.1 Process Flow
         self._heading("2.2.1  PROCESS FLOW", 3)
         self._add_flowchart_image(flowchart_path, project_name)
-
         self.doc.add_paragraph()
 
         # 2.2.2 Process Steps
@@ -295,7 +383,7 @@ class PDDGenerator:
             data = [["SL #", steps_header]]
             for s in process_steps:
                 num = s.get("number", "")
-                desc = s.get("description", "")
+                desc = _strip_markdown_for_docx(s.get("description", ""))
                 first_sentence = desc.split('.')[0] + '.' if '.' in desc else desc[:100]
                 data.append([str(num), first_sentence])
             self._table(data, widths=[0.5, 6.0])
@@ -309,8 +397,8 @@ class PDDGenerator:
             for i, inp in enumerate(input_requirements):
                 data.append([
                     str(i + 1),
-                    inp.get("parameter", ""),
-                    inp.get("description", "")
+                    _strip_markdown_for_docx(inp.get("parameter", "")),
+                    _strip_markdown_for_docx(inp.get("description", ""))
                 ])
             self._table(data, widths=[0.5, 2.0, 4.0])
         else:
@@ -326,16 +414,23 @@ class PDDGenerator:
         self._heading(f"2.4  {detailed_header.upper()}", 2)
 
         if detailed_steps:
-            annotated_frames = annotated_frames or {}
+            screenshots_added = 0
+
             for step in detailed_steps:
                 step_num = step.get("number", 0)
-                desc = step.get("description", "")
+                desc = _strip_markdown_for_docx(step.get("description", ""))
+
+                # Determine display number
+                if isinstance(step_num, str) and step_num.startswith("2.4."):
+                    display_num = step_num
+                else:
+                    display_num = f"2.4.{step_num}"
 
                 # Step sub-heading
                 p = self.doc.add_paragraph()
                 p.paragraph_format.space_before = Pt(14)
                 p.paragraph_format.space_after = Pt(4)
-                r = p.add_run(f"2.4.{step_num}. {desc}")
+                r = p.add_run(f"{display_num}. {desc}")
                 r.bold = True
                 r.font.size = Pt(11)
                 r.font.name = 'Arial'
@@ -353,18 +448,21 @@ class PDDGenerator:
                         r.font.size = Pt(9)
                         r.font.color.rgb = RGBColor(80, 80, 150)
 
-                # Screenshot
-                frame_path = annotated_frames.get(step_num, "")
-                if not frame_path or not os.path.exists(frame_path):
+                # Find screenshot — try multiple lookup strategies
+                frame_path = _resolve_step_number(step_num, annotated_frames)
+
+                # Also check step's own frame_after_path
+                if (not frame_path or not os.path.exists(frame_path)):
                     frame_path = step.get("frame_after_path", "")
 
                 if frame_path and os.path.exists(frame_path):
-                    try:
-                        self.doc.add_picture(frame_path, width=Inches(5.5))
-                        self.doc.paragraphs[-1].alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-                        self.doc.paragraphs[-1].paragraph_format.space_after = Pt(10)
-                    except Exception as e:
-                        print(f"    [PDDDoc] Could not add image for step {step_num}: {e}")
+                    if self._add_screenshot(frame_path, display_num):
+                        screenshots_added += 1
+
+            if screenshots_added > 0:
+                print(f"    [PDDDoc] Added {screenshots_added} screenshots to Section 2.4")
+            else:
+                print(f"    [PDDDoc] Warning: No screenshots were added to Section 2.4")
         else:
             self._para("Detailed process steps with screenshots to be documented.")
 
@@ -377,8 +475,8 @@ class PDDGenerator:
             for i, app in enumerate(interface_requirements):
                 data.append([
                     str(i + 1),
-                    app.get("application", ""),
-                    app.get("purpose", "")
+                    _strip_markdown_for_docx(app.get("application", "")),
+                    _strip_markdown_for_docx(app.get("purpose", ""))
                 ])
             self._table(data, widths=[0.5, 2.5, 3.5])
         else:
@@ -395,23 +493,23 @@ class PDDGenerator:
             data = [["Exception Scenario", "Handling Action"]]
             for exc in exception_handling:
                 data.append([
-                    exc.get("exception", ""),
-                    exc.get("handling", "")
+                    _strip_markdown_for_docx(exc.get("exception", "")),
+                    _strip_markdown_for_docx(exc.get("handling", ""))
                 ])
             self._table(data, widths=[2.5, 4.5])
         else:
             self._table([
                 ["Exception Scenario", "Handling Action"],
                 ["Application Login Failure",
-                 "Stop execution, log error, notify support."],
+                 "The system stops execution, logs the error, and sends a notification."],
                 ["Record Not Found",
-                 "Log failure, skip, continue processing."],
+                 "The system logs the failure, skips the record, and continues processing."],
             ], widths=[2.5, 4.5])
 
         # Save
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
         self.doc.save(output_path)
-        print(f"  📄 PDD document saved: {output_path}")
+        print(f"  PDD document saved: {output_path}")
         return output_path
 
     def append_frames_with_text(
@@ -421,10 +519,7 @@ class PDDGenerator:
         detailed_steps: List[Dict] = None,
         start_step: int = 1
     ):
-        """
-        Append screenshots under Section 2.4 format.
-        Each frame gets a 2.4.x sub-number with description and screenshot.
-        """
+        """Append screenshots under Section 2.4 format."""
         if not os.path.exists(doc_path):
             return
         if not frame_text_pairs and not detailed_steps:
@@ -432,7 +527,6 @@ class PDDGenerator:
 
         doc = Document(doc_path)
 
-        # Apply narrow margins
         margin = Inches(config.document.margin_inches)
         for section in doc.sections:
             section.top_margin = margin
@@ -442,7 +536,6 @@ class PDDGenerator:
 
         detailed_header = config.document.detailed_steps_header
 
-        # Find Section 2.4 and 2.5
         section_24_idx = None
         section_25_idx = None
 
@@ -456,7 +549,6 @@ class PDDGenerator:
                 section_25_idx = i
                 break
 
-        # Clear existing placeholder content
         if section_24_idx is not None and section_25_idx is not None:
             for i in range(section_24_idx + 1, section_25_idx):
                 if i < len(doc.paragraphs):
@@ -465,10 +557,8 @@ class PDDGenerator:
                         run.text = ""
                     p.text = ""
 
-        # Append at end
         doc.add_page_break()
 
-        # Re-add heading
         h = doc.add_paragraph()
         h.paragraph_format.space_before = Pt(0)
         h.paragraph_format.space_after = Pt(8)
@@ -478,7 +568,6 @@ class PDDGenerator:
         r.font.name = 'Arial'
         r.font.color.rgb = RGBColor.from_string("0D3B66")
 
-        # Determine total steps
         num_frames = len(frame_text_pairs) if frame_text_pairs else 0
         num_detailed = len(detailed_steps) if detailed_steps else 0
         total_steps = max(num_frames, num_detailed)
@@ -486,15 +575,13 @@ class PDDGenerator:
         for i in range(total_steps):
             step_num = f"2.4.{i + 1}"
 
-            # Get description
             if detailed_steps and i < num_detailed:
-                desc = detailed_steps[i].get("description", "")
+                desc = _strip_markdown_for_docx(detailed_steps[i].get("description", ""))
             elif frame_text_pairs and i < num_frames:
-                desc = frame_text_pairs[i][1]
+                desc = _strip_markdown_for_docx(frame_text_pairs[i][1])
             else:
                 desc = "Process step"
 
-            # Step sub-heading
             p = doc.add_paragraph()
             p.paragraph_format.space_before = Pt(14)
             p.paragraph_format.space_after = Pt(6)
@@ -503,7 +590,6 @@ class PDDGenerator:
             r.font.size = Pt(11)
             r.font.name = 'Arial'
 
-            # Screenshot
             if frame_text_pairs and i < num_frames:
                 frame_path = frame_text_pairs[i][0]
                 if frame_path and os.path.exists(frame_path):

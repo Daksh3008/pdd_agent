@@ -1,9 +1,8 @@
-# llm/process_steps.py
+# llm_tasks/process_steps.py
 
 """
 Process step extraction from transcript.
-High-level automation steps and detailed screen-level steps.
-Used by the audio pipeline.
+Used as FALLBACK only — primary extraction is via meeting_compact.py.
 """
 
 import time
@@ -13,10 +12,10 @@ from core.gemini_client import gemini_client
 from core.config import config
 from core.utils import (
     timed, safe_sample, build_entity_hint,
-    filter_conversation_steps, parse_numbered_steps, deduplicate_steps
+    filter_conversation_steps, parse_numbered_steps,
+    deduplicate_steps, enforce_tone, redact_pii_text
 )
-from llm_tasks.system_prompts import get_system_prompt
-from llm_tasks.entity_extraction import extract_entities_and_project
+from llm_tasks.system_prompts import get_system_prompt, TONE_RULES
 
 
 def extract_process_steps(
@@ -25,113 +24,60 @@ def extract_process_steps(
 ) -> List[str]:
     """
     Extract automation process steps from transcript.
-    PDD: screen-level system actions
-    BRD: functional requirements
+    Fallback method — prefer generate_doc_bundle_from_transcript().
     """
     start = time.time()
 
     if entities is None:
+        from llm_tasks.entity_extraction import extract_entities_and_project
         entities, _ = extract_entities_and_project(transcript)
 
     entity_hint = build_entity_hint(entities)
-    doc_type = config.document.document_type
-    all_steps = []
-
-    # Strategy 1: Full extraction
-    print("    [Steps] Strategy 1: Full extraction...")
     sample = safe_sample(transcript, max_len=config.llm.max_sample_text)
 
-    if doc_type == "BRD":
-        task_instruction = (
-            "Write 8-15 numbered FUNCTIONAL REQUIREMENTS describing "
-            "what the solution must do.\n"
-            "Use 'The system shall...' or 'The solution must...' format."
-        )
-        examples = (
-            "- \"The system shall authenticate users via secure credentials.\"\n"
-            "- \"The solution must extract and validate data from the source system.\""
-        )
-    else:
-        task_instruction = (
-            "Write 8-15 numbered steps describing what the "
-            "AUTOMATED SYSTEM does.\n"
-            "Start each with a verb: Connects, Extracts, Validates, "
-            "Navigates, Generates, Updates, Logs."
-        )
-        examples = (
-            "- \"Connects to [Application] using authorized credentials.\"\n"
-            "- \"Extracts relevant data from the source system.\"\n"
-            "- \"Validates each record against the defined criteria.\""
-        )
-
-    prompt = f"""Extract the process from this meeting transcript.
+    prompt = f"""You are a senior Business Analyst extracting process steps from a meeting transcript.
 
 {entity_hint}
 
-{task_instruction}
+YOUR TASK:
+Extract 8-15 HIGH-LEVEL AUTOMATION STEPS describing what the automated system does end-to-end.
 
-CRITICAL: Extract PROCESS ACTIONS, not meeting conversation.
+RULES:
+- Each step starts with an action verb: Connects, Navigates, Extracts, Validates, Processes, Generates, Updates, Logs.
+- Each step describes what THE SYSTEM does, not what people discussed.
+- Use ONLY application/system names from the transcript.
+- NEVER include meeting conversations, scheduling, or coordination activities.
+- NEVER include personal names, emails, or phone numbers.
+{TONE_RULES}
 
-WRONG (do NOT include):
-- "Team discussed downloading data"
-- "Coordinate with team member"
-
-CORRECT:
-{examples}
-
-Use ONLY names from the transcript.
+EXAMPLES OF CORRECT STEPS:
+1. The system connects to the target application using authorized credentials.
+2. The system navigates to the data management module.
+3. The system extracts records from the source database based on configured criteria.
+4. The system validates each record against the defined business rules.
+5. The system processes eligible records and updates their status.
 
 TRANSCRIPT:
 {sample}
 
-STEPS:
+OUTPUT (numbered list only):
 1."""
 
     response = gemini_client.generate(
         prompt=prompt,
         system_prompt=get_system_prompt(),
-        call_name="ProcessSteps_S1"
+        call_name="ProcessSteps_Fallback"
     )
 
+    all_steps = []
     if response:
         if not response.strip().startswith("1"):
             response = "1. " + response
         all_steps = parse_numbered_steps(response)
         all_steps = filter_conversation_steps(all_steps)
-        print(f"    [Steps] Strategy 1: {len(all_steps)} steps")
+        all_steps = [redact_pii_text(s) for s in all_steps]
 
-    # Strategy 2: Simplified
     if len(all_steps) < 3:
-        print("    [Steps] Strategy 2: Simplified...")
-        prompt = f"""What steps will an automated system perform for this process?
-
-{entity_hint}
-
-Write 8-12 steps. Start each with a verb.
-Do NOT include conversations, scheduling, or coordination.
-Use ONLY names from the transcript.
-
-{safe_sample(transcript, config.llm.max_sample_small)}
-
-Steps:
-1."""
-        response = gemini_client.generate(
-            prompt=prompt,
-            system_prompt=get_system_prompt(),
-            call_name="ProcessSteps_S2"
-        )
-        if response:
-            if not response.strip().startswith("1"):
-                response = "1. " + response
-            s2 = parse_numbered_steps(response)
-            s2 = filter_conversation_steps(s2)
-            if len(s2) > len(all_steps):
-                all_steps = s2
-            print(f"    [Steps] Strategy 2: {len(s2)} steps")
-
-    # Strategy 3: Template fallback
-    if len(all_steps) < 3:
-        print("    [Steps] Strategy 3: Template...")
         all_steps = _template_steps(entities)
 
     unique = deduplicate_steps(all_steps)
@@ -152,52 +98,45 @@ def get_detailed_process_steps(
 ) -> List[Dict]:
     """
     Extract detailed step-by-step process for Section 2.4.
-    PDD: screen-level actions
-    BRD: detailed functional requirements
+    Fallback method — prefer generate_doc_bundle_from_transcript().
     """
     start = time.time()
     sample = safe_sample(transcript, max_len=config.llm.max_sample_text)
-    doc_type = config.document.document_type
 
-    if doc_type == "BRD":
-        instruction = (
-            "List 10-25 detailed FUNCTIONAL REQUIREMENTS:\n"
-            "- Each requirement describes a specific capability\n"
-            "- Use 'The system shall...' format"
-        )
-    else:
-        instruction = (
-            "List 10-25 detailed steps describing specific screen-level actions:\n"
-            "- Logging into applications\n"
-            "- Navigating to specific pages/tabs\n"
-            "- Clicking buttons or menu items\n"
-            "- Entering data in fields\n"
-            "- Downloading or exporting files\n"
-            "- Processing or validating records\n"
-            "- Generating reports"
-        )
-
-    prompt = f"""Write detailed instructions for the automated process.
+    prompt = f"""You are a senior Business Analyst writing detailed process steps for a PDD Section 2.4.
 
 Project: "{project_name}". {entity_hint}
 
-{instruction}
+YOUR TASK:
+Write 15-25 DETAILED SCREEN-LEVEL STEPS describing specific system actions.
 
-Do NOT include steps about meetings, conversations, or coordinating with people.
-Use ONLY names from the transcript.
+Each step must describe ONE specific action the system performs:
+- Logging into applications (with credential handling)
+- Navigating to specific pages, tabs, or modules
+- Clicking buttons, selecting menu items
+- Entering data in specific fields
+- Downloading, exporting, or saving files
+- Processing, filtering, or validating records
+- Generating reports or summaries
+- Handling errors or exceptions
 
-Numbered list, each step 1-2 sentences.
+RULES:
+- Each step is 1-2 sentences describing a specific system action.
+- Start each with "The system..." or "The automation..."
+- Be specific about UI elements: "The system clicks the 'Submit' button", not "The system submits".
+- NEVER include meeting discussions, conversations, or coordination.
+- NEVER include personal names, emails, or phone numbers.
 
 TRANSCRIPT:
 {sample}
 
-STEPS:
+OUTPUT (numbered list only):
 1."""
 
     response = gemini_client.generate(
         prompt=prompt,
         system_prompt=get_system_prompt(),
-        call_name="DetailedSteps"
+        call_name="DetailedSteps_Fallback"
     )
     timed("Detailed Steps", start)
 
@@ -208,6 +147,8 @@ STEPS:
         parsed = parse_numbered_steps(response)
         parsed = filter_conversation_steps(parsed)
         for i, step in enumerate(parsed):
+            step = enforce_tone(step)
+            step = redact_pii_text(step)
             detailed.append({
                 "number": f"2.4.{i+1}",
                 "description": step
@@ -215,12 +156,14 @@ STEPS:
 
     if not detailed:
         detailed = [
-            {"number": "2.4.1", "description": "Log in to the target application."},
-            {"number": "2.4.2", "description": "Navigate to the relevant section."},
-            {"number": "2.4.3", "description": "Extract and process the required data."},
-            {"number": "2.4.4", "description": "Validate records against defined criteria."},
-            {"number": "2.4.5", "description": "Perform required actions for validated records."},
-            {"number": "2.4.6", "description": "Generate reports and update execution status."},
+            {"number": "2.4.1", "description": "The system opens the target application and navigates to the login page."},
+            {"number": "2.4.2", "description": "The system enters the configured credentials and authenticates."},
+            {"number": "2.4.3", "description": "The system navigates to the relevant processing module."},
+            {"number": "2.4.4", "description": "The system extracts the required data from the source."},
+            {"number": "2.4.5", "description": "The system validates each record against the defined business rules."},
+            {"number": "2.4.6", "description": "The system processes eligible records and updates their status."},
+            {"number": "2.4.7", "description": "The system generates a summary report of processed records."},
+            {"number": "2.4.8", "description": "The system logs execution details and closes the application."},
         ]
     return detailed
 
@@ -232,13 +175,13 @@ def _template_steps(entities: Dict) -> List[str]:
         or 'the target application'
     )
     return [
-        f"Connects to {apps} using authorized credentials.",
-        f"Extracts relevant data from {apps}.",
-        "Filters and processes records based on defined business rules.",
-        "Validates each record against the defined criteria.",
-        f"Performs the required actions for eligible records in {apps}.",
-        "Captures updated status after processing each record.",
-        "Generates a report containing processed records and outcomes.",
-        "Updates the execution status based on results.",
-        "Logs execution details for audit and tracking.",
+        f"The system connects to {apps} using authorized credentials.",
+        f"The system navigates to the relevant processing module within {apps}.",
+        "The system extracts the required data from the configured source.",
+        "The system filters records based on the defined business criteria.",
+        "The system validates each record against the established rules.",
+        f"The system performs the required processing actions in {apps}.",
+        "The system captures and records the updated status for each processed item.",
+        "The system generates a comprehensive execution report.",
+        "The system updates the process status and logs all execution details.",
     ]

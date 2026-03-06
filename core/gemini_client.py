@@ -2,7 +2,9 @@
 
 """
 Unified Gemini API client for text and vision calls.
-Includes Thread Locking to safely handle parallel workers without hitting rate limits.
+Uses `google-genai` SDK.
+Enhanced rate limiting for free-tier (5-15 RPM).
+Tracks daily request count.
 """
 
 import os
@@ -19,53 +21,71 @@ from core.config import config
 
 
 class GeminiClient:
-    """
-    Unified client for Google Gemini API.
-    Supports text-only and multimodal (text + image) generation.
-    """
-
     def __init__(self):
         self._client = None
         self._tracker = None
-        
-        # Rate Limiting & Thread Safety
+
         self._lock = threading.Lock()
         self._last_request_time = 0.0
-        # Calculate minimum seconds between requests (e.g., 60 / 15 RPM = 4 seconds)
         self._min_request_interval = 60.0 / max(config.gemini.requests_per_minute, 1)
-        
+        self._daily_count = 0
+        self._day_start = time.time()
+
+        self._last_health_error: str = ""
         self._configure()
 
     def _configure(self):
-        """Configure Gemini API client."""
         api_key = config.gemini.api_key
         if not api_key:
-            print("    [Gemini] ⚠ No API key set. Set GEMINI_API_KEY environment variable.")
+            self._client = None
+            print("    [Gemini] No API key set. Set GEMINI_API_KEY environment variable.")
             return
         try:
             self._client = genai.Client(api_key=api_key)
-            print(f"    [Gemini] ✓ Configured (text: {config.gemini.text_model}, "
-                  f"vision: {config.gemini.vision_model})")
+            self._last_health_error = ""
+            print(
+                f"    [Gemini] Configured (text: {config.gemini.text_model}, "
+                f"vision: {config.gemini.vision_model}, "
+                f"RPM: {config.gemini.requests_per_minute})"
+            )
         except Exception as e:
-            print(f"    [Gemini] ✗ Configuration failed: {e}")
+            self._client = None
+            self._last_health_error = f"{type(e).__name__}: {e}"
+            print(f"    [Gemini] Configuration failed: {self._last_health_error}")
 
     def set_tracker(self, tracker):
-        """Attach a TokenTracker to record all calls."""
         self._tracker = tracker
 
+    def is_configured(self) -> bool:
+        return self._client is not None
+
+    def last_health_error(self) -> str:
+        return self._last_health_error
+
     def _rate_limit(self):
-        """Thread-safe rate limiter based on requests per minute."""
+        """Enforce rate limit with daily counter reset."""
         with self._lock:
+            # Reset daily counter if new day
             now = time.time()
+            if now - self._day_start > 86400:
+                self._daily_count = 0
+                self._day_start = now
+
+            # Check daily limit
+            if self._daily_count >= config.gemini.requests_per_day:
+                print("    [Gemini] Daily request limit reached. Waiting 60s...")
+                time.sleep(60)
+
+            # Enforce per-minute spacing
             elapsed = now - self._last_request_time
             if elapsed < self._min_request_interval:
                 wait = self._min_request_interval - elapsed
                 time.sleep(wait)
-            # Update time *after* sleeping to ensure the next thread waits full duration
+
             self._last_request_time = time.time()
+            self._daily_count += 1
 
     def _prepare_image(self, image_path: str) -> Optional[Image.Image]:
-        """Load and resize image for Gemini vision."""
         if not image_path or not os.path.exists(image_path):
             return None
         try:
@@ -76,10 +96,10 @@ class GeminiClient:
             if img.width > max_w or img.height > max_h:
                 img.thumbnail((max_w, max_h), Image.LANCZOS)
 
-            if img.mode == 'RGBA':
-                img = img.convert('RGB')
-            elif img.mode not in ('RGB', 'L'):
-                img = img.convert('RGB')
+            if img.mode == "RGBA":
+                img = img.convert("RGB")
+            elif img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
 
             return img
         except Exception as e:
@@ -94,11 +114,10 @@ class GeminiClient:
         temperature: float = None,
         max_output_tokens: int = None,
         call_name: str = None,
-        max_retries: int = 3
+        max_retries: int = 3,
     ) -> Optional[str]:
-        """Generate response from Gemini."""
         if not self._client:
-            print("    [Gemini] ✗ Not configured. Set GEMINI_API_KEY.")
+            print("    [Gemini] Not configured. Set GEMINI_API_KEY.")
             return None
 
         has_images = bool(image_paths)
@@ -106,111 +125,130 @@ class GeminiClient:
         temp = temperature if temperature is not None else config.llm.temperature
         max_tokens = max_output_tokens or config.llm.max_output_tokens
 
-        # Prepare contents list
         contents = []
-        pil_images = []
         if has_images:
-            for img_path in image_paths:
-                img = self._prepare_image(img_path)
+            for p in image_paths:
+                img = self._prepare_image(p)
                 if img:
-                    pil_images.append(img)
                     contents.append(img)
-            if not pil_images and image_paths:
-                print(f"    [Gemini] ⚠ No images could be loaded")
+            if image_paths and not contents:
+                print("    [Gemini] No images could be loaded")
                 return None
-                
+
         contents.append(prompt)
 
-        gen_config_kwargs = {
+        gen_kwargs = {
             "temperature": temp,
             "top_p": config.llm.top_p,
             "max_output_tokens": max_tokens,
         }
         if system_prompt:
-            gen_config_kwargs["system_instruction"] = system_prompt
-            
-        gen_config = types.GenerateContentConfig(**gen_config_kwargs)
+            gen_kwargs["system_instruction"] = system_prompt
 
-        # Retry loop
+        gen_config = types.GenerateContentConfig(**gen_kwargs)
+
         for attempt in range(max_retries + 1):
+            start = time.time()
             try:
-                # This will safely queue up parallel threads!
                 self._rate_limit()
-                
-                start = time.time()
-                prompt_preview = prompt[:80].replace('\n', ' ')
-                img_str = f", {len(pil_images)} img" if pil_images else ""
+
+                preview = prompt[:80].replace("\n", " ")
+                img_str = f", {len(image_paths)} img" if has_images else ""
                 print(
-                    f"    [Gemini] Sending ({len(prompt)} chars{img_str}, "
-                    f"model={model_name}): \"{prompt_preview}...\" "
-                    f"(attempt {attempt + 1})"
+                    f'    [Gemini] Sending ({len(prompt)} chars{img_str}, model={model_name}): '
+                    f'"{preview}..." (attempt {attempt + 1}, daily: {self._daily_count})'
                 )
 
-                response = self._client.models.generate_content(
+                resp = self._client.models.generate_content(
                     model=model_name,
                     contents=contents,
-                    config=gen_config
+                    config=gen_config,
                 )
 
                 elapsed = time.time() - start
-                result = response.text.strip() if response.text else None
+                text = (resp.text or "").strip() or None
 
-                actual_prompt_tokens = 0
-                actual_response_tokens = 0
-                if hasattr(response, 'usage_metadata') and response.usage_metadata:
-                    actual_prompt_tokens = getattr(response.usage_metadata, 'prompt_token_count', 0) or 0
-                    actual_response_tokens = getattr(response.usage_metadata, 'candidates_token_count', 0) or 0
+                prompt_tokens = 0
+                response_tokens = 0
+                if hasattr(resp, "usage_metadata") and resp.usage_metadata:
+                    prompt_tokens = getattr(resp.usage_metadata, "prompt_token_count", 0) or 0
+                    response_tokens = getattr(resp.usage_metadata, "candidates_token_count", 0) or 0
 
-                if result:
-                    token_info = f" [tokens: {actual_prompt_tokens}→{actual_response_tokens}]" if actual_prompt_tokens > 0 else ""
-                    print(f"    [Gemini] ✓ {len(result)} chars in {elapsed:.1f}s{token_info}")
+                if text:
+                    token_info = f" [tokens: {prompt_tokens}>{response_tokens}]" if prompt_tokens else ""
+                    print(f"    [Gemini] {len(text)} chars in {elapsed:.1f}s{token_info}")
                 else:
-                    print(f"    [Gemini] ⚠ Empty response after {elapsed:.1f}s")
+                    print(f"    [Gemini] Empty response after {elapsed:.1f}s")
 
-                self._record(call_name, model_name, prompt, system_prompt, result, elapsed, actual_prompt_tokens, actual_response_tokens, has_images)
-                return result
+                self._record(
+                    call_name, model_name, prompt, system_prompt, text,
+                    elapsed, prompt_tokens, response_tokens, has_images
+                )
+                return text
 
             except APIError as e:
-                elapsed = time.time() - start if 'start' in dir() else 0
-                
                 if e.code == 429:
-                    wait = 10 * (attempt + 1) # Force longer wait on 429
-                    print(f"    [Gemini] ⚠ Quota exceeded. Thread pausing for {wait}s...")
+                    wait = 15 * (attempt + 1)
+                    print(f"    [Gemini] Rate limited (429). Waiting {wait}s...")
                     time.sleep(wait)
-                elif e.code in [500, 503]:
+                    continue
+                if e.code in (500, 503):
                     wait = 5 * (attempt + 1)
-                    print(f"    [Gemini] ⚠ Server error ({e.code}). Retry in {wait}s...")
+                    print(f"    [Gemini] Server error ({e.code}). Waiting {wait}s...")
                     time.sleep(wait)
-                else:
-                    print(f"    [Gemini] ✗ API Error {e.code}: {e.message}")
-                    break
-                    
-                if attempt == max_retries:
-                    self._record(call_name, model_name, prompt, system_prompt, None, elapsed, 0, 0, has_images)
-                    
+                    continue
+                print(f"    [Gemini] API Error {e.code}: {e.message}")
+                break
             except Exception as e:
-                print(f"    [Gemini] ✗ Unexpected error: {type(e).__name__}: {str(e)}")
-                if attempt == max_retries:
-                    break
+                print(f"    [Gemini] Unexpected error: {type(e).__name__}: {e}")
+                if attempt < max_retries:
+                    time.sleep(5)
+                    continue
+                break
 
+        self._record(call_name, model_name, prompt, system_prompt, None, time.time() - start, 0, 0, has_images)
         return None
 
-    def _record(self, call_name, model_name, prompt, system_prompt, response, duration, actual_prompt, actual_response, has_image):
+    def _record(
+        self, call_name, model_name, prompt, system_prompt,
+        response, duration, actual_prompt, actual_response, has_image
+    ):
         if self._tracker and call_name:
-            self._tracker.record(call_name=call_name, model=model_name, prompt=prompt or "", response=response or "", duration=duration, system_prompt=system_prompt or "", actual_prompt_tokens=actual_prompt, actual_response_tokens=actual_response, has_image=has_image)
+            self._tracker.record(
+                call_name=call_name,
+                model=model_name,
+                prompt=prompt or "",
+                response=response or "",
+                duration=duration,
+                system_prompt=system_prompt or "",
+                actual_prompt_tokens=actual_prompt,
+                actual_response_tokens=actual_response,
+                has_image=has_image
+            )
 
     def is_available(self) -> bool:
         if not self._client:
-            return False
-        try:
-            response = self._client.models.generate_content(
-                model=config.gemini.text_model,
-                contents="Reply with OK",
-                config=types.GenerateContentConfig(max_output_tokens=5, temperature=0.0)
-            )
-            return bool(response.text)
-        except Exception:
+            self._last_health_error = "Client not configured"
             return False
 
-# Global client instance
+        try:
+            it = self._client.models.list()
+            for _ in it:
+                break
+            self._last_health_error = ""
+            return True
+
+        except APIError as e:
+            self._last_health_error = f"{e.code} - {e.message}"
+            if e.code == 429:
+                return True
+            if e.code in (401, 403):
+                return False
+            return False
+
+        except Exception as e:
+            self._last_health_error = f"{type(e).__name__}: {e}"
+            return False
+
+
 gemini_client = GeminiClient()
