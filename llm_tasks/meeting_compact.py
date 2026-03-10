@@ -28,22 +28,535 @@ from llm_tasks.system_prompts import get_system_prompt, TONE_RULES
 # JSON extraction helpers
 # ============================================================
 
-def _extract_json_object(text: str) -> Optional[str]:
-    """Extract the first JSON object from a response."""
+def _repair_json(text: str) -> str:
+    """
+    Attempt to repair common JSON issues from LLM output.
+    Handles: trailing commas, unescaped newlines in strings,
+    missing commas between keys, single quotes, unquoted keys,
+    truncated responses, unescaped quotes inside values.
+    """
     if not text:
-        return None
-    text = text.strip()
-    text = re.sub(r'^```(?:json)?\s*', '', text)
-    text = re.sub(r'\s*```$', '', text)
-    text = text.strip()
-
-    if text.startswith("{") and text.endswith("}"):
         return text
 
+    # Remove any BOM or invisible characters
+    text = text.strip('\ufeff\u200b\u200c\u200d')
+
+    # Fix single quotes used as string delimiters
+    text = re.sub(r"(?<=[{,\[])\s*'([^']+)'\s*:", r' "\1":', text)
+    text = re.sub(r":\s*'([^']*)'(?=\s*[,}\]])", r': "\1"', text)
+
+    # Fix unquoted keys: { key: "value" } -> { "key": "value" }
+    text = re.sub(r'(?<=[{,])\s*(\w+)\s*:', r' "\1":', text)
+
+    # Fix trailing commas before closing braces/brackets
+    text = re.sub(r',\s*}', '}', text)
+    text = re.sub(r',\s*\]', ']', text)
+
+    # Fix missing commas between key-value pairs
+    text = re.sub(r'"\s*\n\s*"(?=\w+"\s*:)', '",\n"', text)
+
+    # Fix missing commas after closing braces/brackets before new keys
+    text = re.sub(r'}\s*\n\s*"(?=\w+"\s*:)', '},\n"', text)
+    text = re.sub(r']\s*\n\s*"(?=\w+"\s*:)', '],\n"', text)
+
+    # Fix unescaped newlines inside string values
+    text = _escape_newlines_in_strings(text)
+
+    # Fix unescaped quotes inside string values
+    text = _fix_inner_quotes(text)
+
+    # Handle truncated JSON (missing closing braces/brackets)
+    open_braces = text.count('{') - text.count('}')
+    open_brackets = text.count('[') - text.count(']')
+
+    if open_braces > 0 or open_brackets > 0:
+        # Check if we're inside an unterminated string
+        in_string = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == '\\' and in_string:
+                i += 2
+                continue
+            if ch == '"':
+                in_string = not in_string
+            i += 1
+
+        if in_string:
+            text = text + '"'
+
+        # Re-clean trailing commas after adding quote
+        text = re.sub(r',\s*$', '', text.rstrip())
+
+        for _ in range(max(0, open_brackets)):
+            text = text.rstrip().rstrip(',') + ']'
+        for _ in range(max(0, open_braces)):
+            text = text.rstrip().rstrip(',') + '}'
+
+    return text
+
+
+def _escape_newlines_in_strings(text: str) -> str:
+    """Escape literal newlines inside JSON string values."""
+    result = []
+    in_string = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+
+        if ch == '\\' and in_string and i + 1 < len(text):
+            result.append(ch)
+            result.append(text[i + 1])
+            i += 2
+            continue
+
+        if ch == '"':
+            in_string = not in_string
+            result.append(ch)
+            i += 1
+            continue
+
+        if ch == '\n' and in_string:
+            result.append('\\n')
+            i += 1
+            continue
+
+        if ch == '\r' and in_string:
+            i += 1
+            continue
+
+        if ch == '\t' and in_string:
+            result.append('\\t')
+            i += 1
+            continue
+
+        result.append(ch)
+        i += 1
+
+    return ''.join(result)
+
+
+def _fix_inner_quotes(text: str) -> str:
+    """
+    Fix unescaped double quotes inside JSON string values.
+    
+    Strategy: Walk through character by character, tracking whether we're
+    inside a JSON string. When we encounter a quote inside a string that
+    doesn't look like a JSON delimiter (not followed by :, ,, }, ]), 
+    escape it.
+    """
+    # First try parsing as-is
+    try:
+        json.loads(text)
+        return text
+    except json.JSONDecodeError:
+        pass
+
+    result = []
+    i = 0
+    in_string = False
+    string_start = -1
+
+    while i < len(text):
+        ch = text[i]
+
+        # Handle escape sequences inside strings
+        if ch == '\\' and in_string and i + 1 < len(text):
+            result.append(ch)
+            result.append(text[i + 1])
+            i += 2
+            continue
+
+        if ch == '"':
+            if not in_string:
+                # Opening a string
+                in_string = True
+                string_start = i
+                result.append(ch)
+                i += 1
+                continue
+            else:
+                # Could be closing the string OR an unescaped inner quote
+                # Look ahead to determine
+                after = text[i + 1:].lstrip() if i + 1 < len(text) else ''
+
+                is_closing = False
+                if not after:
+                    is_closing = True
+                elif after[0] in (',', '}', ']', ':'):
+                    is_closing = True
+                elif after.startswith('\\n'):
+                    # This is inside the string value, probably an inner quote
+                    is_closing = False
+                elif re.match(r'^[,}\]:]', after):
+                    is_closing = True
+
+                if is_closing:
+                    in_string = False
+                    result.append(ch)
+                else:
+                    # Inner quote — escape it
+                    result.append('\\"')
+
+                i += 1
+                continue
+
+        result.append(ch)
+        i += 1
+
+    return ''.join(result)
+
+
+def _extract_json_object(text: str) -> Optional[str]:
+    """Extract the first JSON object from a response, with repair attempts."""
+    if not text:
+        return None
+
+    text = text.strip()
+
+    # Remove markdown code fences
+    text = re.sub(r'^```(?:json)?\s*', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\s*```\s*$', '', text, flags=re.MULTILINE)
+    text = text.strip()
+
+    # Try direct parse first
+    if text.startswith("{"):
+        try:
+            json.loads(text)
+            return text
+        except json.JSONDecodeError:
+            pass
+
+    # Extract JSON object using brace matching
+    json_text = _extract_balanced_braces(text)
+
+    if json_text:
+        # Try parsing as-is
+        try:
+            json.loads(json_text)
+            return json_text
+        except json.JSONDecodeError:
+            pass
+
+        # Try repair
+        repaired = _repair_json(json_text)
+        try:
+            json.loads(repaired)
+            print("    [JSON] Repaired malformed JSON successfully")
+            return repaired
+        except json.JSONDecodeError as e:
+            print(f"    [JSON] Repair attempt 1 failed: {e}")
+
+            # Try aggressive repair: re-extract values as raw strings
+            aggressive = _aggressive_json_repair(json_text)
+            if aggressive:
+                try:
+                    json.loads(aggressive)
+                    print("    [JSON] Aggressive repair succeeded")
+                    return aggressive
+                except json.JSONDecodeError as e2:
+                    print(f"    [JSON] Aggressive repair failed: {e2}")
+
+            # Last resort: truncation
+            truncated = _truncate_to_valid_json(repaired)
+            if truncated:
+                print("    [JSON] Recovered partial JSON via truncation")
+                return truncated
+
+    # Fallback: regex extraction
     m = re.search(r"(\{.*\})", text, re.DOTALL)
     if m:
-        return m.group(1).strip()
+        candidate = m.group(1).strip()
+        repaired = _repair_json(candidate)
+        try:
+            json.loads(repaired)
+            return repaired
+        except json.JSONDecodeError:
+            aggressive = _aggressive_json_repair(candidate)
+            if aggressive:
+                try:
+                    json.loads(aggressive)
+                    return aggressive
+                except json.JSONDecodeError:
+                    pass
+
     return None
+
+
+def _aggressive_json_repair(text: str) -> Optional[str]:
+    """
+    Aggressive JSON repair: extract key-value pairs using regex patterns
+    and reconstruct a clean JSON object. Handles cases where inner quotes,
+    newlines, and special characters completely break standard parsing.
+    """
+    if not text:
+        return None
+
+    # Try to extract each top-level key and its value
+    # Pattern matches "key": followed by either a string, array, or object value
+    
+    # First, identify all top-level keys
+    key_pattern = re.compile(r'"(\w+)"\s*:\s*', re.DOTALL)
+    keys_found = [(m.group(1), m.start(), m.end()) for m in key_pattern.finditer(text)]
+    
+    if not keys_found:
+        return None
+
+    extracted = {}
+    
+    for idx, (key, key_start, val_start) in enumerate(keys_found):
+        # Determine where this value ends (next top-level key or end of object)
+        if idx + 1 < len(keys_found):
+            # Value ends just before the next key's quote
+            # But we need to find the comma before the next key
+            next_key_start = keys_found[idx + 1][1]
+            raw_value = text[val_start:next_key_start].strip()
+            # Remove trailing comma
+            raw_value = raw_value.rstrip().rstrip(',').strip()
+        else:
+            # Last key - value goes to end of object
+            raw_value = text[val_start:].strip()
+            # Remove trailing braces
+            raw_value = raw_value.rstrip().rstrip('}').rstrip(',').strip()
+
+        # Parse the value based on what it starts with
+        parsed_value = _parse_raw_value(raw_value, key)
+        if parsed_value is not None:
+            extracted[key] = parsed_value
+
+    if not extracted:
+        return None
+
+    try:
+        result = json.dumps(extracted, ensure_ascii=False)
+        json.loads(result)  # Verify it's valid
+        return result
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _parse_raw_value(raw: str, key: str) -> Any:
+    """Parse a raw JSON value string, handling malformed content."""
+    if not raw:
+        return "" if key not in ('entities',) else {}
+
+    raw = raw.strip()
+
+    # Try direct JSON parse first
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Array value: [...] 
+    if raw.startswith('['):
+        return _parse_raw_array(raw)
+
+    # Object value: {...}
+    if raw.startswith('{'):
+        repaired = _repair_json(raw)
+        try:
+            return json.loads(repaired)
+        except (json.JSONDecodeError, ValueError):
+            return {}
+
+    # String value: "..."
+    if raw.startswith('"'):
+        return _parse_raw_string(raw)
+
+    # Unquoted value - treat as string
+    return raw.strip('"').strip()
+
+
+def _parse_raw_array(raw: str) -> List:
+    """Parse a raw array value, handling malformed elements."""
+    # Try direct parse
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Try repair then parse
+    repaired = _repair_json(raw)
+    try:
+        return json.loads(repaired)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Manual extraction: find string elements
+    items = []
+    
+    # Check if array contains objects (dicts) or strings
+    if '{' in raw:
+        # Array of objects - extract each {...} block
+        obj_pattern = re.compile(r'\{([^{}]*)\}')
+        for m in obj_pattern.finditer(raw):
+            obj_text = '{' + m.group(1) + '}'
+            repaired_obj = _repair_json(obj_text)
+            try:
+                items.append(json.loads(repaired_obj))
+            except (json.JSONDecodeError, ValueError):
+                # Try to extract key-value pairs manually
+                kv_pattern = re.compile(r'"(\w+)"\s*:\s*"([^"]*)"')
+                obj_dict = {}
+                for kv in kv_pattern.finditer(m.group(1)):
+                    obj_dict[kv.group(1)] = kv.group(2)
+                if obj_dict:
+                    items.append(obj_dict)
+    else:
+        # Array of strings - extract quoted strings
+        str_pattern = re.compile(r'"((?:[^"\\]|\\.)*)"')
+        for m in str_pattern.finditer(raw):
+            val = m.group(1).strip()
+            if val and len(val) > 3:
+                items.append(val)
+
+    return items
+
+
+def _parse_raw_string(raw: str) -> str:
+    """Parse a raw string value, handling unescaped characters."""
+    # Try direct parse
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Strip outer quotes and clean up
+    if raw.startswith('"') and raw.endswith('"'):
+        inner = raw[1:-1]
+    elif raw.startswith('"'):
+        # Missing closing quote
+        inner = raw[1:]
+    else:
+        inner = raw
+
+    # Escape problematic characters
+    inner = inner.replace('\\', '\\\\')  # Escape backslashes first
+    inner = inner.replace('\n', '\\n')
+    inner = inner.replace('\r', '')
+    inner = inner.replace('\t', '\\t')
+    
+    # Handle unescaped inner quotes - replace with escaped
+    # But we already stripped outer quotes, so all remaining quotes are inner
+    inner = inner.replace('"', '\\"')
+
+    try:
+        return json.loads(f'"{inner}"')
+    except (json.JSONDecodeError, ValueError):
+        # Last resort: return cleaned raw text
+        return inner.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
+
+
+def _extract_balanced_braces(text: str) -> Optional[str]:
+    """Extract a balanced JSON object by tracking brace depth."""
+    start = text.find('{')
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    i = start
+
+    while i < len(text):
+        ch = text[i]
+
+        if ch == '\\' and in_string:
+            i += 2
+            continue
+
+        if ch == '"':
+            in_string = not in_string
+        elif not in_string:
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+        i += 1
+
+    # If unbalanced, return what we have plus closing braces
+    if depth > 0:
+        fragment = text[start:]
+        fragment = fragment.rstrip().rstrip(',')
+        fragment += '}' * depth
+        return fragment
+
+    return None
+
+
+def _truncate_to_valid_json(text: str) -> Optional[str]:
+    """
+    Progressively truncate JSON to find the largest valid subset.
+    Useful when Gemini truncates the response mid-value.
+    """
+    if not text:
+        return None
+
+    # Strategy 1: Try removing content from the end to find valid JSON
+    for end_pattern in [
+        r',\s*"[^"]*"\s*:\s*(?:"(?:[^"\\]|\\.)*$)',  # Unterminated string value
+        r',\s*"[^"]*"\s*:\s*\[(?:[^\]]*$)',  # Unterminated array
+        r',\s*"[^"]*"\s*:\s*\{(?:[^}]*$)',  # Unterminated object
+        r',\s*"[^"]*"\s*:\s*(?:"[^"]*"|[\[\{]).*$',  # Last incomplete k-v pair
+        r',\s*"[^"]*"\s*:.*$',  # Any trailing incomplete pair
+    ]:
+        truncated = re.sub(end_pattern, '', text, flags=re.DOTALL)
+        if truncated != text and len(truncated) > 10:
+            repaired = _repair_json(truncated)
+            try:
+                json.loads(repaired)
+                return repaired
+            except json.JSONDecodeError:
+                continue
+
+    # Strategy 2: Find the last complete key-value pair by looking for
+    # the last valid comma-separated boundary
+    # Find positions of all top-level commas (not inside strings/nested)
+    comma_positions = _find_top_level_commas(text)
+    
+    # Try truncating at each comma from the end
+    for pos in reversed(comma_positions):
+        candidate = text[:pos].rstrip() 
+        # Close any open structures
+        repaired = _repair_json(candidate)
+        try:
+            json.loads(repaired)
+            return repaired
+        except json.JSONDecodeError:
+            continue
+
+    return None
+
+
+def _find_top_level_commas(text: str) -> List[int]:
+    """Find positions of commas at the top level of a JSON object (depth 1)."""
+    positions = []
+    depth = 0
+    in_string = False
+    i = 0
+
+    while i < len(text):
+        ch = text[i]
+
+        if ch == '\\' and in_string:
+            i += 2
+            continue
+
+        if ch == '"':
+            in_string = not in_string
+        elif not in_string:
+            if ch in ('{', '['):
+                depth += 1
+            elif ch in ('}', ']'):
+                depth -= 1
+            elif ch == ',' and depth == 1:
+                positions.append(i)
+
+        i += 1
+
+    return positions
 
 
 def _coerce_list_str(x: Any) -> List[str]:
@@ -88,7 +601,6 @@ def _apply_tone_and_redaction(text: str) -> str:
         return text
     text = enforce_tone(text)
     text = redact_pii_text(text)
-    # Remove markdown bold markers
     text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
     text = re.sub(r'__([^_]+)__', r'\1', text)
     return text
@@ -98,15 +610,11 @@ def _strip_markdown(text: str) -> str:
     """Remove all markdown formatting from text."""
     if not text:
         return text
-    # Bold
     text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
     text = re.sub(r'__([^_]+)__', r'\1', text)
-    # Italic
     text = re.sub(r'\*([^*]+)\*', r'\1', text)
     text = re.sub(r'_([^_]+)_', r'\1', text)
-    # Headers
     text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
-    # Bullet normalization
     text = re.sub(r'^[-*]\s+', '- ', text, flags=re.MULTILINE)
     return text
 
@@ -166,23 +674,25 @@ SECTION REQUIREMENTS:
    - Future automated process, written in present tense as if operational.
    - Cover trigger, data handling, validation, processing, reporting, logging.
 
-CRITICAL RULES:
+CRITICAL JSON RULES:
 - Use ONLY names from the transcript. Never invent names.
 - NEVER mention the meeting, transcript, recording, or speakers.
 - NEVER include personal names, emails, or phone numbers.
 - Write in THIRD PERSON, PRESENT TENSE, ACTIVE VOICE.
 - DO NOT use markdown formatting (no **, no ##, no __).
-- Output STRICT JSON only. No markdown fences, no commentary.
+- IMPORTANT: All string values MUST be on a SINGLE LINE. Use \\n for paragraph breaks within strings.
+- IMPORTANT: Escape all double quotes inside string values with backslash: \\"
+- Output STRICT valid JSON only. No markdown fences, no commentary before or after.
 
 JSON FORMAT:
 {{
   "project_name": "string",
   "entities": {{"companies": [], "applications": [], "systems": [], "departments": []}},
-  "purpose": "string",
-  "overview": "string",
-  "justification": "string",
-  "as_is": "string",
-  "to_be": "string"
+  "purpose": "paragraph 1\\n\\nparagraph 2\\n\\nparagraph 3",
+  "overview": "paragraph\\n\\n- bullet 1\\n- bullet 2",
+  "justification": "paragraph\\n\\n1. benefit title - description\\n2. benefit title - description",
+  "as_is": "paragraph 1\\n\\nparagraph 2\\n\\nBusiness Challenges:\\n- challenge 1\\n- challenge 2",
+  "to_be": "paragraph 1\\n\\nparagraph 2\\n\\nparagraph 3"
 }}
 
 TRANSCRIPT:
@@ -227,9 +737,11 @@ TRANSCRIPT:
                     val = _apply_tone_and_redaction(val)
                     result["document"][key] = val
 
+            print(f"    [DocBundle_Sections] Parsed successfully: "
+                  f"{sum(1 for v in result['document'].values() if v)}/5 sections")
+
         except json.JSONDecodeError as e:
-            print(f"    [DocBundle_Sections] JSON parse failed: {e}")
-            # Try to extract sections from raw text
+            print(f"    [DocBundle_Sections] JSON parse failed after all repair attempts: {e}")
             result["document"] = _fallback_parse_sections(resp)
         except Exception as e:
             print(f"    [DocBundle_Sections] Error: {type(e).__name__}: {e}")
@@ -331,21 +843,41 @@ def _fallback_parse_sections(raw_text: str) -> Dict[str, str]:
 
     raw_text = _strip_markdown(raw_text)
 
-    # Try to find labeled sections
     section_patterns = {
-        "purpose": [r'(?:purpose|document purpose)[:\s]*(.*?)(?=overview|justification|as.is|to.be|\Z)'],
-        "overview": [r'(?:overview|objective)[:\s]*(.*?)(?=justification|as.is|to.be|\Z)'],
-        "justification": [r'(?:justification|business justification)[:\s]*(.*?)(?=as.is|to.be|\Z)'],
-        "as_is": [r'(?:as.is|current state|current process)[:\s]*(.*?)(?=to.be|future|\Z)'],
-        "to_be": [r'(?:to.be|future state|automated process)[:\s]*(.*?)$'],
+        "purpose": [
+            r'(?:"?purpose"?\s*[:=]\s*"?)(.*?)(?="?\s*,?\s*"?(?:overview|justification|as.is|to.be|entities)"?\s*[:=]|\Z)',
+            r'(?:purpose|document purpose)[:\s]*(.*?)(?=overview|justification|as.is|to.be|\Z)',
+        ],
+        "overview": [
+            r'(?:"?overview"?\s*[:=]\s*"?)(.*?)(?="?\s*,?\s*"?(?:justification|as.is|to.be)"?\s*[:=]|\Z)',
+            r'(?:overview|objective)[:\s]*(.*?)(?=justification|as.is|to.be|\Z)',
+        ],
+        "justification": [
+            r'(?:"?justification"?\s*[:=]\s*"?)(.*?)(?="?\s*,?\s*"?(?:as.is|to.be)"?\s*[:=]|\Z)',
+            r'(?:justification|business justification)[:\s]*(.*?)(?=as.is|to.be|\Z)',
+        ],
+        "as_is": [
+            r'(?:"?as.is"?\s*[:=]\s*"?)(.*?)(?="?\s*,?\s*"?(?:to.be)"?\s*[:=]|\Z)',
+            r'(?:as.is|current state|current process)[:\s]*(.*?)(?=to.be|future|\Z)',
+        ],
+        "to_be": [
+            r'(?:"?to.be"?\s*[:=]\s*"?)(.*?)(?="?\s*}|\Z)',
+            r'(?:to.be|future state|automated process)[:\s]*(.*?)$',
+        ],
     }
 
     for key, patterns in section_patterns.items():
         for pattern in patterns:
             m = re.search(pattern, raw_text, re.DOTALL | re.IGNORECASE)
             if m and len(m.group(1).strip()) > 30:
-                sections[key] = _apply_tone_and_redaction(m.group(1).strip())
+                val = m.group(1).strip().strip('"').strip()
+                val = val.replace('\\n', '\n')
+                sections[key] = _apply_tone_and_redaction(val)
                 break
+
+    found = sum(1 for v in sections.values() if v)
+    if found > 0:
+        print(f"    [DocBundle_Sections] Fallback parser recovered {found}/5 sections")
 
     return sections
 
@@ -425,13 +957,15 @@ exception_handling (6-10 items):
 - Include: login failure, timeout, missing data, validation error, system crash.
 - Handling must be in third person: "The system retries...", "The system logs..."
 
-CRITICAL RULES:
+CRITICAL JSON RULES:
 - Use ONLY application names from the transcript.
 - NEVER mention the meeting, transcript, or speakers.
 - NEVER include personal names, emails, or phone numbers.
 - Third person, present tense, active voice.
 - DO NOT use markdown formatting.
-- Output STRICT JSON only.
+- IMPORTANT: Keep all string values on a SINGLE LINE. No literal line breaks inside strings.
+- IMPORTANT: Escape any double quotes inside strings with backslash: \\"
+- Output STRICT valid JSON only. No text before or after the JSON object.
 
 TRANSCRIPT:
 {sample}
@@ -471,8 +1005,15 @@ TRANSCRIPT:
                 data.get("exception_handling"), ("exception", "handling")
             )
 
+            print(f"    [DocBundle_ProcessData] Parsed: "
+                  f"{len(result['process_steps'])} steps, "
+                  f"{len(result['detailed_steps'])} detailed, "
+                  f"{len(result['input_requirements'])} inputs, "
+                  f"{len(result['interface_requirements'])} interfaces, "
+                  f"{len(result['exception_handling'])} exceptions")
+
         except json.JSONDecodeError as e:
-            print(f"    [DocBundle_ProcessData] JSON parse failed: {e}")
+            print(f"    [DocBundle_ProcessData] JSON parse failed after all repairs: {e}")
             result = _fallback_parse_process_data(resp)
         except Exception as e:
             print(f"    [DocBundle_ProcessData] Error: {type(e).__name__}: {e}")
@@ -565,7 +1106,6 @@ def _fallback_parse_process_data(raw_text: str) -> Dict[str, Any]:
 
     raw_text = _strip_markdown(raw_text)
 
-    # Try to extract numbered lists
     lines = raw_text.split('\n')
     current_section = None
 
@@ -580,13 +1120,13 @@ def _fallback_parse_process_data(raw_text: str) -> Dict[str, Any]:
         elif 'detailed_step' in lower or 'detailed step' in lower:
             current_section = 'detailed_steps'
             continue
-        elif 'input_req' in lower or 'input req' in lower:
+        elif 'input_req' in lower or 'input req' in lower or 'input_param' in lower:
             current_section = 'input_requirements'
             continue
         elif 'interface_req' in lower or 'interface req' in lower:
             current_section = 'interface_requirements'
             continue
-        elif 'exception' in lower:
+        elif 'exception' in lower and ('handl' in lower or ':' in line):
             current_section = 'exception_handling'
             continue
 
@@ -603,24 +1143,37 @@ def _fallback_parse_process_data(raw_text: str) -> Dict[str, Any]:
 
         if current_section in ('process_steps', 'detailed_steps'):
             result[current_section].append(cleaned)
-        elif current_section == 'input_requirements' and '|' in cleaned:
-            parts = cleaned.split('|', 1)
-            result[current_section].append({
-                "parameter": parts[0].strip(),
-                "description": parts[1].strip() if len(parts) > 1 else ""
-            })
-        elif current_section == 'interface_requirements' and '|' in cleaned:
-            parts = cleaned.split('|', 1)
-            result[current_section].append({
-                "application": parts[0].strip(),
-                "purpose": parts[1].strip() if len(parts) > 1 else ""
-            })
-        elif current_section == 'exception_handling' and '|' in cleaned:
-            parts = cleaned.split('|', 1)
-            result[current_section].append({
-                "exception": parts[0].strip(),
-                "handling": parts[1].strip() if len(parts) > 1 else ""
-            })
+        elif current_section == 'input_requirements':
+            if '|' in cleaned:
+                parts = cleaned.split('|', 1)
+                result[current_section].append({
+                    "parameter": parts[0].strip(),
+                    "description": parts[1].strip() if len(parts) > 1 else ""
+                })
+            elif ':' in cleaned:
+                parts = cleaned.split(':', 1)
+                result[current_section].append({
+                    "parameter": parts[0].strip(),
+                    "description": parts[1].strip() if len(parts) > 1 else ""
+                })
+        elif current_section == 'interface_requirements':
+            if '|' in cleaned:
+                parts = cleaned.split('|', 1)
+                result[current_section].append({
+                    "application": parts[0].strip(),
+                    "purpose": parts[1].strip() if len(parts) > 1 else ""
+                })
+        elif current_section == 'exception_handling':
+            if '|' in cleaned:
+                parts = cleaned.split('|', 1)
+                result[current_section].append({
+                    "exception": parts[0].strip(),
+                    "handling": parts[1].strip() if len(parts) > 1 else ""
+                })
+
+    found_sections = sum(1 for v in result.values() if v)
+    if found_sections > 0:
+        print(f"    [DocBundle_ProcessData] Fallback parser recovered {found_sections}/5 sections")
 
     return result
 

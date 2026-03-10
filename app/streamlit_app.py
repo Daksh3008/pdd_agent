@@ -305,11 +305,31 @@ def main():
                             use_container_width=True
                         )
 
-                        # Display flowchart
-                        flowchart_path = os.path.join(output_dir, "flowchart.png")
-                        if os.path.exists(flowchart_path):
+                        # Display flowchart — check for SVG first, then PNG
+                        flowchart_svg = os.path.join(output_dir, "flowchart.svg")
+                        flowchart_png = os.path.join(output_dir, "flowchart.png")
+
+                        if os.path.exists(flowchart_svg):
+                            try:
+                                with open(flowchart_svg, 'r', encoding='utf-8') as f:
+                                    svg_content = f.read()
+                                flowchart_placeholder.markdown(
+                                    f'<div style="text-align: center; background: white; '
+                                    f'padding: 20px; border-radius: 8px; '
+                                    f'border: 1px solid #e0e0e0;">'
+                                    f'{svg_content}</div>',
+                                    unsafe_allow_html=True
+                                )
+                            except Exception as e:
+                                # Fall back to image display if SVG rendering fails
+                                converted_png = os.path.join(output_dir, "flowchart_converted.png")
+                                if os.path.exists(converted_png):
+                                    flowchart_placeholder.image(
+                                        converted_png, caption="Process Flowchart"
+                                    )
+                        elif os.path.exists(flowchart_png):
                             flowchart_placeholder.image(
-                                flowchart_path, caption="Process Flowchart"
+                                flowchart_png, caption="Process Flowchart"
                             )
 
                         st.info(f"📁 Files saved to: `{config.paths.output_dir}/`")

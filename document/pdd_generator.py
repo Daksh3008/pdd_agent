@@ -3,7 +3,8 @@
 """
 PDD/BRD Document Generator.
 Unified DOCX generator used by both audio and video pipelines.
-Supports flowchart insertion, screenshot annotation, and detailed steps.
+Supports flowchart insertion (SVG converted to PNG for DOCX, or direct PNG),
+screenshot annotation, and detailed steps.
 Strips all markdown formatting before inserting into DOCX.
 """
 
@@ -75,6 +76,83 @@ def _resolve_step_number(step_num, annotated_frames: Dict) -> str:
     return ""
 
 
+def _convert_svg_to_png(svg_path: str) -> Optional[str]:
+    """
+    Convert SVG to PNG for DOCX embedding.
+    DOCX does not natively support SVG, so we convert.
+    Tries multiple methods: cairosvg, Pillow+cairosvg, Inkscape CLI.
+    """
+    if not svg_path or not os.path.exists(svg_path):
+        return None
+
+    png_path = os.path.splitext(svg_path)[0] + '_converted.png'
+
+    # Already a PNG
+    if svg_path.lower().endswith('.png'):
+        return svg_path
+
+    # Method 1: cairosvg (best quality)
+    try:
+        import cairosvg
+        cairosvg.svg2png(url=svg_path, write_to=png_path, dpi=200)
+        if os.path.exists(png_path):
+            print(f"    [PDDDoc] SVG→PNG via cairosvg: {png_path}")
+            return png_path
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"    [PDDDoc] cairosvg conversion failed: {e}")
+
+    # Method 2: svglib + reportlab
+    try:
+        from svglib.svglib import svg2rlg
+        from reportlab.graphics import renderPM
+        drawing = svg2rlg(svg_path)
+        if drawing:
+            renderPM.drawToFile(drawing, png_path, fmt='PNG', dpi=200)
+            if os.path.exists(png_path):
+                print(f"    [PDDDoc] SVG→PNG via svglib: {png_path}")
+                return png_path
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"    [PDDDoc] svglib conversion failed: {e}")
+
+    # Method 3: Inkscape CLI
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['inkscape', svg_path, '--export-type=png',
+             f'--export-filename={png_path}', '--export-dpi=200'],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0 and os.path.exists(png_path):
+            print(f"    [PDDDoc] SVG→PNG via Inkscape: {png_path}")
+            return png_path
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    except Exception as e:
+        print(f"    [PDDDoc] Inkscape conversion failed: {e}")
+
+    # Method 4: Pillow with wand (ImageMagick)
+    try:
+        from wand.image import Image as WandImage
+        with WandImage(filename=svg_path, resolution=200) as img:
+            img.format = 'png'
+            img.save(filename=png_path)
+        if os.path.exists(png_path):
+            print(f"    [PDDDoc] SVG→PNG via Wand: {png_path}")
+            return png_path
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"    [PDDDoc] Wand conversion failed: {e}")
+
+    print(f"    [PDDDoc] Warning: Could not convert SVG to PNG. "
+          f"Install cairosvg (pip install cairosvg) for best results.")
+    return None
+
+
 class PDDGenerator:
     """Unified PDD/BRD document generator."""
 
@@ -140,14 +218,24 @@ class PDDGenerator:
         self.doc.add_paragraph()
 
     def _add_flowchart_image(self, flowchart_path: str, project_name: str):
-        """Add flowchart to document with proper sizing."""
+        """Add flowchart to document with proper sizing. Handles SVG and PNG."""
         if not flowchart_path or not os.path.exists(flowchart_path):
             self._para("[Flowchart to be inserted]")
             return
 
+        # If SVG, convert to PNG for DOCX embedding
+        image_path = flowchart_path
+        if flowchart_path.lower().endswith('.svg'):
+            converted = _convert_svg_to_png(flowchart_path)
+            if converted and os.path.exists(converted):
+                image_path = converted
+            else:
+                self._para("[Flowchart generated as SVG — install cairosvg to embed in DOCX]")
+                return
+
         try:
             from PIL import Image
-            img = Image.open(flowchart_path)
+            img = Image.open(image_path)
             img_width, img_height = img.size
 
             max_width = config.flowchart.max_width_inches
@@ -161,11 +249,11 @@ class PDDGenerator:
                 height = max_height
                 width = height / aspect_ratio
 
-            self.doc.add_picture(flowchart_path, width=Inches(width))
+            self.doc.add_picture(image_path, width=Inches(width))
             self.doc.paragraphs[-1].alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
 
         except ImportError:
-            self.doc.add_picture(flowchart_path, width=Inches(6.5))
+            self.doc.add_picture(image_path, width=Inches(6.5))
             self.doc.paragraphs[-1].alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
 
         except Exception as e:
@@ -448,10 +536,9 @@ class PDDGenerator:
                         r.font.size = Pt(9)
                         r.font.color.rgb = RGBColor(80, 80, 150)
 
-                # Find screenshot — try multiple lookup strategies
+                # Find screenshot
                 frame_path = _resolve_step_number(step_num, annotated_frames)
 
-                # Also check step's own frame_after_path
                 if (not frame_path or not os.path.exists(frame_path)):
                     frame_path = step.get("frame_after_path", "")
 

@@ -19,8 +19,8 @@ from typing import Dict, List
 class GeminiConfig:
     """Google Gemini API configuration."""
     api_key: str = os.getenv("GEMINI_API_KEY", "")
-    text_model: str = os.getenv("GEMINI_TEXT_MODEL", "gemini-2.5-flash")
-    vision_model: str = os.getenv("GEMINI_VISION_MODEL", "gemini-2.5-flash")
+    text_model: str = os.getenv("GEMINI_TEXT_MODEL", "gemini-3-flash-preview")
+    vision_model: str = os.getenv("GEMINI_VISION_MODEL", "gemini-3-flash-preview")
 
     # Rate limiting — tuned for free tier (5-15 RPM)
     requests_per_minute: int = int(os.getenv("GEMINI_RPM", "8"))

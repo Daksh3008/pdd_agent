@@ -65,7 +65,7 @@ def save_dot_code(dot_code: str, project_name: str, output_dir: str):
 def save_flowchart_persistent(
     flowchart_path: str, dot_code: str, project_name: str
 ):
-    """Save flowchart PNG and DOT to persistent outputs/."""
+    """Save flowchart SVG/PNG and DOT to persistent outputs/."""
     d = config.paths.output_dir
     os.makedirs(d, exist_ok=True)
     safe = "".join(
@@ -73,13 +73,16 @@ def save_flowchart_persistent(
     ).strip()[:50] or "flowchart"
 
     if flowchart_path and os.path.exists(flowchart_path):
-        png_dest = os.path.join(d, f"{safe}_flowchart.png")
+        # Determine extension from the actual file
+        _, ext = os.path.splitext(flowchart_path)
+        ext = ext or '.svg'
+        dest = os.path.join(d, f"{safe}_flowchart{ext}")
         c = 1
-        while os.path.exists(png_dest):
-            png_dest = os.path.join(d, f"{safe}_flowchart_{c}.png")
+        while os.path.exists(dest):
+            dest = os.path.join(d, f"{safe}_flowchart_{c}{ext}")
             c += 1
-        shutil.copy2(flowchart_path, png_dest)
-        print(f"  📁 Flowchart PNG: {png_dest}")
+        shutil.copy2(flowchart_path, dest)
+        print(f"  📁 Flowchart: {dest}")
 
     if dot_code:
         dot_dest = os.path.join(d, f"{safe}_flowchart.dot")
@@ -95,7 +98,7 @@ def save_flowchart_persistent(
 def generate_flowchart(
     dot_code: str, output_dir: str, project_name: str
 ) -> str:
-    """Generate flowchart PNG from DOT code and save persistently."""
+    """Generate flowchart SVG from DOT code and save persistently."""
     if not dot_code:
         return ""
     fc_output = os.path.join(output_dir, "flowchart")
