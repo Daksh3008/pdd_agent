@@ -24,6 +24,7 @@ class ProcessedFrame(BaseModel):
 class QueryRequest(BaseModel):
     query: str
     top_k: int = 5
+    video_id: str | None = None
 
 
 class FrameMatch(BaseModel):

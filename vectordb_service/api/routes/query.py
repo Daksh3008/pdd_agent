@@ -15,7 +15,7 @@ def query_frames(
     """Query indexed frames by natural-language text. Returns matching
     frames ranked by cosine similarity."""
 
-    result = query_service.query_frames(body.query, body.top_k)
+    result = query_service.query_frames(body.query, body.top_k, body.video_id)
 
     return QueryResponse(
         query=result["query"],

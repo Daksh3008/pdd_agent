@@ -23,7 +23,7 @@ class QueryService:
         self._embedding = embedding_service
         self._vector_store = vector_store
 
-    def query_frames(self, query_text: str, top_k: int = 5) -> dict:
+    def query_frames(self, query_text: str, top_k: int = 5, video_id: str | None = None) -> dict:
         # Text embedding (512-d for CLIP ViT-B/32)
         text_emb = self._embedding.get_text_embedding(query_text)
         emb_dim = text_emb.shape[-1]
@@ -34,7 +34,8 @@ class QueryService:
             [zero_image.flatten(), text_emb.flatten()]
         ).tolist()
 
-        results = self._vector_store.query(combined, top_k=top_k)
+        metadata_filter = {"video_id": {"$eq": video_id}} if video_id else None
+        results = self._vector_store.query(combined, top_k=top_k, filter=metadata_filter)
 
         matches: list[dict] = []
         for m in results.get("matches", []):
