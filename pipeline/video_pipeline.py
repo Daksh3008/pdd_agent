@@ -9,11 +9,12 @@ Flow:
 2. OCR all frames (parallel)
 3. Detect auth screens
 4. Analyze transitions with vision AI (smart selection)
-5. Synthesize PDD steps (parallel)
-6. Generate document sections (parallel)
-7. Generate flowchart
-8. Annotate frames
-9. Assemble PDD document
+5. Synthesize detailed screen-by-screen steps (Section 2.4)
+6. Infer logical high-level process steps (Section 2.2.2 & Flowchart)  <-- NEW
+7. Generate document sections (parallel)
+8. Generate flowchart
+9. Annotate frames
+10. Assemble PDD document
 """
 
 import os
@@ -34,7 +35,7 @@ from video.change_detector import detect_changes_between_frames
 from video.frame_annotator import annotate_frame
 
 from llm_tasks.vision_describer import analyze_transitions_smart, identify_application
-from llm_tasks.step_synthesizer import synthesize_pdd_steps
+from llm_tasks.step_synthesizer import synthesize_pdd_steps, generate_logical_process_steps
 from llm_tasks.document_sections import generate_all_sections_parallel
 from llm_tasks.flowchart_dot import generate_flowchart_dot_from_steps
 
@@ -158,20 +159,7 @@ class VideoPipeline:
         annotate: bool = None,
         enable_micro_frames: bool = True
     ) -> Optional[str]:
-        """
-        Process a silent screen recording into a PDD document.
-
-        Args:
-            video_path: Path to video file.
-            project_name: Project name (required).
-            ssim_threshold: Scene detection sensitivity override.
-            max_frames: Max key frames override.
-            annotate: Enable screenshot annotation override.
-            enable_micro_frames: Extract micro-frames around changes.
-
-        Returns:
-            Path to generated document, or None on failure.
-        """
+        """Process a silent screen recording into a PDD document."""
         t0 = time.time()
         tracker = reset_tracker()
         gemini_client.set_tracker(tracker)
@@ -213,13 +201,10 @@ class VideoPipeline:
         print(f"{'='*40}")
         t = time.time()
 
-        scene_changes = detect_scene_changes(
-            video_path, ssim_threshold=ssim_threshold
-        )
+        scene_changes = detect_scene_changes(video_path, ssim_threshold=ssim_threshold)
         if enable_micro_frames and scene_changes:
-            scene_changes = _extract_micro_frames(
-                video_path, scene_changes, frames_dir, fps
-            )
+            scene_changes = _extract_micro_frames(video_path, scene_changes, frames_dir, fps)
+            
         key_frames = select_key_frames(
             scene_changes, output_dir=frames_dir,
             max_frames=max_frames, video_path=video_path,
@@ -252,8 +237,6 @@ class VideoPipeline:
                 auth_count += 1
 
         print(f"  ✓ OCR complete ({time.time()-t:.0f}s)")
-        if auth_count > 0:
-            print(f"  🔐 Detected {auth_count} auth/login screens")
 
         # ── PHASE 3: Vision + Change Analysis ──
         print(f"\n{'='*40}")
@@ -262,17 +245,12 @@ class VideoPipeline:
         t = time.time()
 
         max_vision = _compute_max_vision_calls(len(key_frames)) + auth_count
-        print(f"  Vision budget: {max_vision} calls")
-
-        # Temporarily override max vision calls
         original_max = config.llm.max_vision_calls
         config.llm.max_vision_calls = max_vision
 
         app_name = ""
         if key_frames:
             app_name = identify_application(key_frames[0]["path"])
-            if app_name:
-                print(f"  ✓ Application: {app_name}")
 
         change_data = detect_changes_between_frames(key_frames, ocr_results)
 
@@ -282,10 +260,7 @@ class VideoPipeline:
             ocr_diffs.append(cd.get("text_diff", {}))
             before_kf = key_frames[i] if i < len(key_frames) else {}
             after_kf = key_frames[i + 1] if i + 1 < len(key_frames) else {}
-            ops = detect_operations_delta(
-                before_kf.get('ocr_text', ''),
-                after_kf.get('ocr_text', ''), ""
-            )
+            ops = detect_operations_delta(before_kf.get('ocr_text', ''), after_kf.get('ocr_text', ''), "")
             detected_operations.append(ops)
 
         transitions = analyze_transitions_smart(
@@ -298,30 +273,28 @@ class VideoPipeline:
         vision_used = sum(1 for tr in transitions if tr.get("used_vision"))
         print(f"  ✓ {len(transitions)} transitions, {vision_used} vision ({time.time()-t:.0f}s)")
 
-        # ── PHASE 4: PDD Content ──
+        # ── PHASE 4: PDD Content Generation ──
         print(f"\n{'='*40}")
         print("PHASE 4/5: Generating PDD content...")
         print(f"{'='*40}")
         t = time.time()
 
-        pdd_steps = synthesize_pdd_steps(
-            transitions, change_data, app_name=app_name
-        )
-        print(f"  ✓ {len(pdd_steps)} PDD steps")
+        # Step 4a: Synthesize Detailed Screen-Level Steps (Section 2.4)
+        detailed_pdd_steps = synthesize_pdd_steps(transitions, change_data, app_name=app_name)
+        print(f"  ✓ {len(detailed_pdd_steps)} Detailed Screen Steps generated")
 
-        for i, s in enumerate(pdd_steps[:5]):
-            desc_preview = s['description'][:70]
-            if len(s['description']) > 70:
-                desc_preview += "..."
-            print(f"    {s['number']}. {desc_preview}")
-        if len(pdd_steps) > 5:
-            print(f"    ... +{len(pdd_steps)-5} more")
+        # Step 4b: Synthesize High-Level Logical Steps (Section 2.2.2 & Flowchart)
+        logical_process_steps = generate_logical_process_steps(project_name, detailed_pdd_steps, app_name)
+        print(f"  ✓ {len(logical_process_steps)} Logical Process Steps generated")
 
-        step_descriptions = [s["description"] for s in pdd_steps]
-        vision_descriptions = [
-            kf.get("vision_description", kf.get("ocr_text", ""))
-            for kf in key_frames
+        # Format process steps for PDD Generator
+        formatted_process_steps = [
+            {"number": i + 1, "description": s} for i, s in enumerate(logical_process_steps)
         ]
+
+        # Step 4c: Generate Narrative Sections
+        step_descriptions = [s["description"] for s in detailed_pdd_steps]
+        vision_descriptions = [kf.get("vision_description", kf.get("ocr_text", "")) for kf in key_frames]
 
         sections = generate_all_sections_parallel(
             project_name, app_name, step_descriptions, vision_descriptions
@@ -335,8 +308,10 @@ class VideoPipeline:
         exceptions = sections.get("exceptions") or []
         interfaces = sections.get("interfaces") or []
 
-        # Flowchart
-        dot_code = generate_flowchart_dot_from_steps(pdd_steps, project_name)
+        # Step 4d: Flowchart Generation (uses logical steps instead of detailed steps)
+        # Convert string list back to dict format expected by dot generator
+        logical_dicts = [{"description": s} for s in logical_process_steps]
+        dot_code = generate_flowchart_dot_from_steps(logical_dicts, project_name)
         fc_path = generate_flowchart(dot_code, self.output_dir, project_name)
 
         print(f"  ✓ Phase 4 complete ({time.time()-t:.0f}s)")
@@ -348,8 +323,8 @@ class VideoPipeline:
         t = time.time()
 
         annotated_frames = {}
-        if annotate and pdd_steps:
-            for step in pdd_steps:
+        if annotate and detailed_pdd_steps:
+            for step in detailed_pdd_steps:
                 step_num = step["number"]
                 frame_path = step.get("frame_after_path", "")
                 change_region = step.get("change_region")
@@ -375,9 +350,9 @@ class VideoPipeline:
             justification=ov_just.get("justification", "") if isinstance(ov_just, dict) else "",
             as_is=as_is,
             to_be=to_be,
-            process_steps=pdd_steps,
+            process_steps=formatted_process_steps,     # The inferred logic loops/conditionals
             input_requirements=input_reqs,
-            detailed_steps=pdd_steps,
+            detailed_steps=detailed_pdd_steps,         # The 1-to-1 screenshot steps
             interface_requirements=interfaces,
             exception_handling=exceptions,
             flowchart_path=fc_path,
@@ -399,13 +374,11 @@ class VideoPipeline:
                     all_ops.add(op["display_name"])
 
         stats = {
-            "Steps": len(pdd_steps),
+            "Process Steps": len(formatted_process_steps),
+            "Detailed Steps": len(detailed_pdd_steps),
             "Frames": len(key_frames),
             "Vision calls": vision_used,
-            "Transitions": len(transitions),
         }
-        if auth_count > 0:
-            stats["Auth screens"] = auth_count
         if all_ops:
             stats["Operations"] = ', '.join(sorted(all_ops))
 

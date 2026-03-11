@@ -16,19 +16,20 @@ from core.config import config
 TONE_RULES = """
 MANDATORY WRITING RULES:
 1. Write in THIRD PERSON only. Never use "I", "we", "my", "our", "you".
-2. Use SIMPLE PRESENT TENSE and ACTIVE VOICE.
-3. The subject is always "The system", "The automation", "The process", or "The user".
-4. Be PRECISE and CONCISE. Every sentence must convey actionable information.
+2. Use IMPERATIVE TONE and ACTIVE VOICE. Start sentences with action verbs (e.g., Navigate, Click, Select, Log in).
+3. Do NOT start sentences with "The system", "The automation", "The process", or "The user". Just state the action.
+4. Be PRECISE, MECHANICAL, and CONCISE. 
 5. NEVER reference the meeting, transcript, recording, video, speaker, or discussion.
-6. NEVER include personal names, email addresses, or phone numbers. Use role titles instead (e.g., "the operator", "the administrator").
+6. NEVER include personal names, email addresses, or phone numbers. Use role titles instead.
 7. Do NOT include any instructional text, headers like "OUTPUT:", or meta-commentary.
+8. STRICT ANTI-FLUFF RULE: NEVER explain *why* an action is taken. Do not use phrases like "to complete the process", "to view the list", or "in the primary navigation menu". Just state the exact mechanical action.
 
 TONE EXAMPLES:
-BAD: "I want the button to be red when clicked."
-BAD: "We discussed that the system should validate records."
-BAD: "The button should be red when clicked."
-GOOD: "The system changes the button color to red upon user click."
-GOOD: "The system validates each record against the defined business rules."
+BAD (Fluff): "The system clicks the login button to complete the authentication process."
+GOOD (Mechanical): "Click the 'Sign In' button."
+
+BAD (Fluff): "The system clicks the dropdown menu to view the list of available teams."
+GOOD (Mechanical): "Click the team dropdown and select the target team."
 """
 
 
@@ -46,10 +47,10 @@ YOUR ROLE:
 TRANSLATION RULES:
 - Convert human actions to system actions:
   Human says: "I open the file and check each row"
-  You write: "The system opens the source data file and iterates through each record for validation."
+  You write: "Open the source data file and iterate through each record for validation."
 - Convert discussions to requirements:
   Human says: "We need to make sure duplicates are removed"
-  You write: "The system identifies and removes duplicate records based on the defined matching criteria."
+  You write: "Identify and remove duplicate records based on the defined matching criteria."
 
 ANTI-HALLUCINATION RULES:
 - Use ONLY application names, system names, and entity names that appear EXPLICITLY in the provided text.

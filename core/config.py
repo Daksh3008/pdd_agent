@@ -68,12 +68,12 @@ class DocumentConfig:
 @dataclass
 class FrameExtractionConfig:
     """Frame extraction settings for silent video pipeline."""
-    ssim_threshold: float = 0.85
-    min_frame_gap_seconds: float = 1.5
-    max_key_frames: int = 40
+    ssim_threshold: float = 0.92  # Increased sensitivity to catch small popups/dropdowns
+    min_frame_gap_seconds: float = 1.0
+    max_key_frames: int = 60      # Increased max frames for granular steps
     sample_interval_seconds: float = 0.5
-    histogram_threshold: float = 0.7
-    frames_per_minute: int = 4
+    histogram_threshold: float = 0.8
+    frames_per_minute: int = 6
     absolute_max_frames: int = 300
 
 
@@ -117,7 +117,7 @@ class FlowchartConfig:
     max_width_inches: float = 7.0
     font_name: str = "Arial"
     font_size: int = 11
-    max_label_words: int = 5
+    max_label_words: int = 6
 
 
 # ============================================================
@@ -144,26 +144,26 @@ class RedactionConfig:
 @dataclass
 class LLMParams:
     """Parameters for Gemini generation calls."""
-    temperature: float = 0.3
+    temperature: float = 0.2  # Lower temp = more literal quoting, less abstracting
     top_p: float = 0.85
-    max_output_tokens: int = 8192
+    max_output_tokens: int = 12000
 
     # Timeouts
     request_timeout: int = 120
 
     # Prompt sizing — larger chunks for fewer calls
-    max_sample_text: int = 15000
-    max_sample_small: int = 6000
+    max_sample_text: int = 18000
+    max_sample_small: int = 8000
     max_sample_entity: int = 8000
     chunk_size: int = 8000
     overlap_size: int = 300
     max_chunks: int = 3
 
     # Vision optimization (silent video pipeline)
-    max_vision_calls: int = 15
-    min_vision_calls: int = 5
+    max_vision_calls: int = 20
+    min_vision_calls: int = 8
     ocr_sufficient_threshold: float = 0.3
-    vision_calls_per_10_frames: int = 3
+    vision_calls_per_10_frames: int = 4
     absolute_max_vision_calls: int = 50
 
     # Parallel workers — keep low for rate limit safety
@@ -171,6 +171,16 @@ class LLMParams:
 
     # Step synthesis batching
     step_batch_size: int = 8
+
+    # Process constraints (New)
+    min_process_steps: int = 8
+    max_process_steps: int = 20
+    min_detailed_steps: int = 15
+    max_detailed_steps: int = 40
+    enable_step_refinement: bool = True
+    refinement_target_multiplier: float = 2.0
+    min_refined_steps: int = 18
+    max_refined_steps: int = 45
 
 
 # ============================================================
@@ -199,7 +209,7 @@ ACTION_KEYWORDS: Dict[str, List[str]] = {
     "paste": ["paste", "insert", "add", "attach"],
     "delete": ["delete", "remove", "erase", "clear", "discard"],
     "upload": ["upload", "attach", "add file"],
-    "download": ["download", "save", "fetch", "retrieve"],
+    "download": ["download", "save", "fetch", "retrieve", "export"],
     "save": ["save", "store", "keep", "preserve", "record"],
     "refresh": ["refresh", "reload", "update"],
     "close": ["close", "exit", "shut down", "terminate", "end"],
@@ -208,6 +218,12 @@ ACTION_KEYWORDS: Dict[str, List[str]] = {
     "review": ["review", "analyze", "check", "evaluate", "inspect"],
     "create": ["create", "build", "generate", "produce"],
     "update": ["update", "modify", "change", "edit", "revise"],
+    "filter": ["filter", "sort", "search", "find", "query", "look up"],
+    "export": ["export", "extract", "pull", "dump", "generate report"],
+    "validate": ["validate", "verify", "check", "cross-reference", "compare", "match"],
+    "repeat": ["repeat", "iterate", "loop", "for each", "every", "again"],
+    "conditional": ["if", "whether", "condition", "else", "otherwise", "based on"],
+    "log": ["log", "record", "capture", "track", "audit", "document"],
 }
 
 

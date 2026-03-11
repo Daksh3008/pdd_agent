@@ -6,7 +6,8 @@ Two approaches:
 1. From transcript (audio pipeline) — uses meeting_compact
 2. From PDD steps (video pipeline) — deterministic step-to-node mapping
 
-All labels enforced to max 5 words.
+Enhanced classification for decisions, loops, and parallel paths.
+All labels enforced to max configured words.
 """
 
 import re
@@ -22,7 +23,7 @@ from llm_tasks.entity_extraction import extract_entities_and_project
 
 
 # ============================================================
-# Step Classification (Deterministic)
+# Step Classification (Enhanced)
 # ============================================================
 
 DECISION_KEYWORDS = [
@@ -31,23 +32,35 @@ DECISION_KEYWORDS = [
     'qualifies', 'is valid', 'is active', 'is inactive',
     'found', 'not found', 'exists', 'does not exist',
     'successful', 'failed', 'pass', 'fail', 'approved', 'rejected',
+    'otherwise', 'condition', 'based on', 'depending on',
+    'disabled', 'enabled', 'blank', 'empty', 'missing',
 ]
 
 LOOP_KEYWORDS = [
     'each', 'every', 'all ', 'iterate', 'repeat', 'loop',
     'next record', 'next item', 'next entry', 'next user',
     'for all', 'processes each', 'validates each',
+    'for every', 'across all', 'one by one',
+    'repeats step', 'repeats the',
 ]
 
 END_PHASE_KEYWORDS = [
     'final report', 'final status', 'execution status',
     'completion', 'summary report', 'audit log',
     'logs out', 'closes', 'terminates', 'ends',
+    'shares the', 'saves the updated', 'saves report',
+]
+
+DATA_OPERATION_KEYWORDS = [
+    'filter', 'remove duplicate', 'extract', 'export',
+    'download', 'consolidate', 'clean', 'merge',
+    'apply filter', 'remove blank', 'deduplicate',
+    'open file', 'open csv', 'open excel',
 ]
 
 
 def classify_steps(steps: List[str]) -> List[Dict]:
-    """Classify each step as PROCESS, DECISION, LOOP, or END_PHASE."""
+    """Classify each step as PROCESS, DECISION, LOOP, DATA_OP, or END_PHASE."""
     classified = []
 
     for i, step in enumerate(steps):
@@ -60,6 +73,8 @@ def classify_steps(steps: List[str]) -> List[Dict]:
             step_type = "LOOP"
         elif any(kw in step_lower for kw in END_PHASE_KEYWORDS):
             step_type = "END_PHASE"
+        elif any(kw in step_lower for kw in DATA_OPERATION_KEYWORDS):
+            step_type = "DATA_OP"
 
         short_label = _shorten_label(step)
         classified.append({
@@ -78,19 +93,14 @@ def classify_steps(steps: List[str]) -> List[Dict]:
 
 
 def _shorten_label(text: str, max_words: int = None) -> str:
-    """
-    Shorten step text to a flowchart-friendly label.
-    Max 5 words, verb+object format.
-    """
+    """Shorten step text to a flowchart-friendly label."""
     max_words = max_words or config.flowchart.max_label_words
 
-    # Remove common prefixes
     text = re.sub(
         r'^(the system|the automation|the bot|the solution|the process|it)\s+',
         '', text, flags=re.IGNORECASE
     ).strip()
 
-    # Remove filler words
     text = re.sub(
         r'\b(the|a|an|to|of|for|in|on|at|by|with|using|based|upon|into)\b',
         ' ', text, flags=re.IGNORECASE
@@ -98,7 +108,6 @@ def _shorten_label(text: str, max_words: int = None) -> str:
     text = re.sub(r'\s+', ' ', text).strip()
     text = text.rstrip('.')
 
-    # Capitalize first letter
     if text:
         text = text[0].upper() + text[1:]
 
@@ -137,7 +146,7 @@ def _generate_dot_from_steps_list(steps: List[str]) -> str:
         }])
 
     filtered = filter_conversation_steps(steps)
-    classified = classify_steps(filtered[:15])
+    classified = classify_steps(filtered[:20])
 
     if not classified:
         return _deterministic_dot([{
@@ -163,7 +172,7 @@ def generate_flowchart_dot_from_steps(
         return ""
 
     descriptions = [s.get("description", "") for s in pdd_steps]
-    classified = classify_steps(descriptions[:20])
+    classified = classify_steps(descriptions[:25])
 
     if not classified:
         timed("Flowchart", start)
@@ -183,7 +192,7 @@ def generate_flowchart_dot_from_steps(
 
 
 # ============================================================
-# Deterministic DOT Generation
+# Deterministic DOT Generation (Enhanced)
 # ============================================================
 
 def _deterministic_dot(
@@ -191,7 +200,9 @@ def _deterministic_dot(
     rankdir: str = "TB",
     size_hint: str = 'size="8,10"'
 ) -> str:
-    """Generate DOT code deterministically from classified steps."""
+    """Generate DOT code deterministically from classified steps.
+    Enhanced to handle decisions with proper Yes/No branching
+    and loops that connect back."""
     lines = [
         'digraph ProcessFlow {',
         f'    rankdir={rankdir};',
@@ -203,8 +214,7 @@ def _deterministic_dot(
         '    Start [label="Start", shape=oval, fillcolor=lightgreen];'
     ]
 
-    nodes = ['Start']
-    loop_targets = []
+    nodes = []  # List of (node_id, node_type)
     step_counter = 0
     decision_counter = 0
 
@@ -212,8 +222,8 @@ def _deterministic_dot(
         step_type = c["type"]
         label = c["short_label"].replace('"', '\\"')
 
-        # Wrap long labels (over 20 chars)
-        if len(label) > 20:
+        # Wrap long labels
+        if len(label) > 22:
             words = label.split()
             mid = len(words) // 2
             label = ' '.join(words[:mid]) + '\\n' + ' '.join(words[mid:])
@@ -226,7 +236,7 @@ def _deterministic_dot(
                 f'    {node_id} [label="{question_label}", '
                 f'shape=diamond, fillcolor=gold];'
             )
-            nodes.append(node_id)
+            nodes.append((node_id, "DECISION"))
 
         elif step_type == "LOOP":
             step_counter += 1
@@ -235,16 +245,25 @@ def _deterministic_dot(
                 f'    {node_id} [label="{label}", '
                 f'shape=box, fillcolor=lightblue];'
             )
-            nodes.append(node_id)
+            nodes.append((node_id, "LOOP"))
 
+            # Add loop-back decision
             decision_counter += 1
             loop_decision_id = f'LoopCheck{decision_counter}'
             lines.append(
                 f'    {loop_decision_id} [label="More Items?", '
                 f'shape=diamond, fillcolor=gold];'
             )
-            nodes.append(loop_decision_id)
-            loop_targets.append((loop_decision_id, node_id))
+            nodes.append((loop_decision_id, "LOOP_DECISION"))
+
+        elif step_type == "DATA_OP":
+            step_counter += 1
+            node_id = f'Step{step_counter}'
+            lines.append(
+                f'    {node_id} [label="{label}", '
+                f'shape=box, fillcolor=lightskyblue];'
+            )
+            nodes.append((node_id, "DATA_OP"))
 
         else:
             step_counter += 1
@@ -253,33 +272,40 @@ def _deterministic_dot(
                 f'    {node_id} [label="{label}", '
                 f'shape=box, fillcolor=lightblue];'
             )
-            nodes.append(node_id)
+            nodes.append((node_id, "PROCESS"))
 
     lines.append('    End [label="End", shape=oval, fillcolor=lightcoral];')
-    nodes.append('End')
     lines.append('')
 
     # Build edges
-    i = 0
-    while i < len(nodes) - 1:
-        current = nodes[i]
-        next_node = nodes[i + 1]
+    all_node_ids = ['Start'] + [n[0] for n in nodes] + ['End']
 
-        is_loop_decision = False
-        for loop_dec_id, loop_back_id in loop_targets:
-            if current == loop_dec_id:
-                lines.append(f'    {current} -> {loop_back_id} [label="Yes"];')
-                lines.append(f'    {current} -> {next_node} [label="No"];')
-                is_loop_decision = True
+    i = 0
+    while i < len(all_node_ids) - 1:
+        current = all_node_ids[i]
+        next_node = all_node_ids[i + 1]
+
+        # Find the type of current node
+        current_type = None
+        for nid, ntype in nodes:
+            if nid == current:
+                current_type = ntype
                 break
 
-        if not is_loop_decision:
-            if current.startswith('Decision'):
-                lines.append(f'    {current} -> {next_node} [label="Yes"];')
-                skip_to = nodes[i + 2] if i + 2 < len(nodes) else 'End'
-                lines.append(f'    {current} -> {skip_to} [label="No"];')
-            else:
-                lines.append(f'    {current} -> {next_node};')
+        if current_type == "LOOP_DECISION":
+            # Find the loop body (previous LOOP node)
+            loop_body = all_node_ids[i - 1] if i > 0 else next_node
+            lines.append(f'    {current} -> {loop_body} [label="Yes"];')
+            lines.append(f'    {current} -> {next_node} [label="No"];')
+
+        elif current_type == "DECISION":
+            # Yes goes to next, No skips to the one after or End
+            lines.append(f'    {current} -> {next_node} [label="Yes"];')
+            skip_to = all_node_ids[i + 2] if i + 2 < len(all_node_ids) else 'End'
+            lines.append(f'    {current} -> {skip_to} [label="No"];')
+
+        else:
+            lines.append(f'    {current} -> {next_node};')
 
         i += 1
 
@@ -292,31 +318,22 @@ def _make_question(label: str) -> str:
     label = label.rstrip('.').rstrip('?')
 
     lower = label.lower()
-    if 'valid' in lower:
-        return 'Valid?'
-    if 'eligible' in lower:
-        return 'Eligible?'
-    if 'active' in lower:
-        return 'Active?'
-    if 'found' in lower:
-        return 'Found?'
-    if 'exist' in lower:
-        return 'Exists?'
-    if 'success' in lower:
-        return 'Successful?'
-    if 'fail' in lower:
-        return 'Failed?'
-    if 'match' in lower:
-        return 'Matches?'
-    if 'approv' in lower:
-        return 'Approved?'
-    if 'complet' in lower:
-        return 'Complete?'
-    if 'available' in lower:
-        return 'Available?'
+    question_map = {
+        'valid': 'Valid?', 'eligible': 'Eligible?', 'active': 'Active?',
+        'found': 'Found?', 'exist': 'Exists?', 'success': 'Successful?',
+        'fail': 'Failed?', 'match': 'Matches?', 'approv': 'Approved?',
+        'complet': 'Complete?', 'available': 'Available?',
+        'disabled': 'Account Disabled?', 'inactive': 'Account Inactive?',
+        'blank': 'Data Present?', 'empty': 'Data Present?',
+        'missing': 'Data Found?',
+    }
 
-    # Shorten to max 3 words + "?"
+    for keyword, question in question_map.items():
+        if keyword in lower:
+            return question
+
+    # Shorten to max 4 words + "?"
     words = label.split()
-    if len(words) > 3:
-        label = ' '.join(words[:3])
+    if len(words) > 4:
+        label = ' '.join(words[:4])
     return label + '?'

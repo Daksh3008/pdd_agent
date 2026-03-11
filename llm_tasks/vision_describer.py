@@ -136,41 +136,32 @@ def _select_prompt(
 OUTPUT EXACTLY IN THIS FORMAT (no other text):
 
 SCREEN:
-[2-4 sentences describing the RIGHT screenshot - application name, current page/tab, visible data]
+[Describe the RIGHT screenshot. You MUST explicitly state the exact Tab Name, Breadcrumb path, and any selected Dropdown values visible.]
 
 ACTION:
-[1-2 sentences describing exactly what the user did to go from LEFT to RIGHT screenshot]
+[Describe EXACTLY what the user clicked or typed to go from LEFT to RIGHT screenshot. Quote EXACT button names and exact dropdown values.]
+
+EXAMPLES OF GOOD ACTIONS:
+- "Clicked the 'Home' tab."
+- "Selected 'Regional Team' from the user group dropdown."
+- "Clicked the 'Export to CSV' button located in the top right."
+- "Clicked 'Download' and a browser file download popup appeared."
 """
 
     if auth_info and auth_info.get("is_auth"):
         auth_type = auth_info.get("auth_type", "login")
         return f"""Two screenshots side-by-side: LEFT = BEFORE, RIGHT = AFTER ({auth_type} screen).
 {format_instruction}
-
-Focus on: login/auth page details, fields, buttons, any messages."""
+Focus on: exact credential fields, "Sign In" / "Next" buttons, or SSO prompts."""
 
     if operation_category == "Excel":
         return f"""Two screenshots side-by-side: LEFT = BEFORE, RIGHT = AFTER (Excel operation).
 {format_instruction}
-
-Focus on: Excel function used, columns/cells involved, formula bar content."""
-
-    if change_type == "page_transition":
-        return f"""Two screenshots side-by-side: LEFT = BEFORE, RIGHT = AFTER (page navigation).
-{format_instruction}
-
-Focus on: what page the user navigated from and to."""
-
-    if change_type == "modal_popup":
-        return f"""Two screenshots side-by-side: LEFT = BEFORE, RIGHT = AFTER (dialog/popup).
-{format_instruction}
-
-Focus on: dialog title, options, what triggered it."""
+Focus on: Excel function used, exact column headers clicked, exact filter values applied (e.g., "Unselected '(Blanks)'")."""
 
     return f"""Two screenshots side-by-side: LEFT = BEFORE, RIGHT = AFTER.
 {format_instruction}
-
-Describe what application is shown and what action the user performed."""
+CRITICAL RULE: DO NOT SUMMARIZE. Read the exact text on the screen."""
 
 
 def describe_transition(

@@ -3,12 +3,11 @@
 """
 Compact meeting transcript → PDD bundle extraction.
 
-TWO consolidated LLM calls:
+THREE consolidated LLM calls:
   Call 1: Document sections (purpose, overview, justification, as-is, to-be)
   Call 2: Process data (steps, detailed steps, inputs, interfaces, exceptions)
-
-This avoids the single-giant-JSON problem where Gemini truncates or
-malforms the response, causing silent parse failures.
+  Call 3: Step refinement — decomposes coarse steps into granular sub-steps
+          with conditionals, loops, data operations, and validation logic
 """
 
 from __future__ import annotations
@@ -31,46 +30,26 @@ from llm_tasks.system_prompts import get_system_prompt, TONE_RULES
 def _repair_json(text: str) -> str:
     """
     Attempt to repair common JSON issues from LLM output.
-    Handles: trailing commas, unescaped newlines in strings,
-    missing commas between keys, single quotes, unquoted keys,
-    truncated responses, unescaped quotes inside values.
     """
     if not text:
         return text
 
-    # Remove any BOM or invisible characters
     text = text.strip('\ufeff\u200b\u200c\u200d')
-
-    # Fix single quotes used as string delimiters
     text = re.sub(r"(?<=[{,\[])\s*'([^']+)'\s*:", r' "\1":', text)
     text = re.sub(r":\s*'([^']*)'(?=\s*[,}\]])", r': "\1"', text)
-
-    # Fix unquoted keys: { key: "value" } -> { "key": "value" }
     text = re.sub(r'(?<=[{,])\s*(\w+)\s*:', r' "\1":', text)
-
-    # Fix trailing commas before closing braces/brackets
     text = re.sub(r',\s*}', '}', text)
     text = re.sub(r',\s*\]', ']', text)
-
-    # Fix missing commas between key-value pairs
     text = re.sub(r'"\s*\n\s*"(?=\w+"\s*:)', '",\n"', text)
-
-    # Fix missing commas after closing braces/brackets before new keys
     text = re.sub(r'}\s*\n\s*"(?=\w+"\s*:)', '},\n"', text)
     text = re.sub(r']\s*\n\s*"(?=\w+"\s*:)', '],\n"', text)
-
-    # Fix unescaped newlines inside string values
     text = _escape_newlines_in_strings(text)
-
-    # Fix unescaped quotes inside string values
     text = _fix_inner_quotes(text)
 
-    # Handle truncated JSON (missing closing braces/brackets)
     open_braces = text.count('{') - text.count('}')
     open_brackets = text.count('[') - text.count(']')
 
     if open_braces > 0 or open_brackets > 0:
-        # Check if we're inside an unterminated string
         in_string = False
         i = 0
         while i < len(text):
@@ -81,13 +60,9 @@ def _repair_json(text: str) -> str:
             if ch == '"':
                 in_string = not in_string
             i += 1
-
         if in_string:
             text = text + '"'
-
-        # Re-clean trailing commas after adding quote
         text = re.sub(r',\s*$', '', text.rstrip())
-
         for _ in range(max(0, open_brackets)):
             text = text.rstrip().rstrip(',') + ']'
         for _ in range(max(0, open_braces)):
@@ -97,55 +72,38 @@ def _repair_json(text: str) -> str:
 
 
 def _escape_newlines_in_strings(text: str) -> str:
-    """Escape literal newlines inside JSON string values."""
     result = []
     in_string = False
     i = 0
     while i < len(text):
         ch = text[i]
-
         if ch == '\\' and in_string and i + 1 < len(text):
             result.append(ch)
             result.append(text[i + 1])
             i += 2
             continue
-
         if ch == '"':
             in_string = not in_string
             result.append(ch)
             i += 1
             continue
-
         if ch == '\n' and in_string:
             result.append('\\n')
             i += 1
             continue
-
         if ch == '\r' and in_string:
             i += 1
             continue
-
         if ch == '\t' and in_string:
             result.append('\\t')
             i += 1
             continue
-
         result.append(ch)
         i += 1
-
     return ''.join(result)
 
 
 def _fix_inner_quotes(text: str) -> str:
-    """
-    Fix unescaped double quotes inside JSON string values.
-    
-    Strategy: Walk through character by character, tracking whether we're
-    inside a JSON string. When we encounter a quote inside a string that
-    doesn't look like a JSON delimiter (not followed by :, ,, }, ]), 
-    escape it.
-    """
-    # First try parsing as-is
     try:
         json.loads(text)
         return text
@@ -155,71 +113,49 @@ def _fix_inner_quotes(text: str) -> str:
     result = []
     i = 0
     in_string = False
-    string_start = -1
 
     while i < len(text):
         ch = text[i]
-
-        # Handle escape sequences inside strings
         if ch == '\\' and in_string and i + 1 < len(text):
             result.append(ch)
             result.append(text[i + 1])
             i += 2
             continue
-
         if ch == '"':
             if not in_string:
-                # Opening a string
                 in_string = True
-                string_start = i
                 result.append(ch)
                 i += 1
                 continue
             else:
-                # Could be closing the string OR an unescaped inner quote
-                # Look ahead to determine
                 after = text[i + 1:].lstrip() if i + 1 < len(text) else ''
-
                 is_closing = False
                 if not after:
                     is_closing = True
                 elif after[0] in (',', '}', ']', ':'):
                     is_closing = True
-                elif after.startswith('\\n'):
-                    # This is inside the string value, probably an inner quote
-                    is_closing = False
                 elif re.match(r'^[,}\]:]', after):
                     is_closing = True
-
                 if is_closing:
                     in_string = False
                     result.append(ch)
                 else:
-                    # Inner quote — escape it
                     result.append('\\"')
-
                 i += 1
                 continue
-
         result.append(ch)
         i += 1
-
     return ''.join(result)
 
 
 def _extract_json_object(text: str) -> Optional[str]:
-    """Extract the first JSON object from a response, with repair attempts."""
     if not text:
         return None
-
     text = text.strip()
-
-    # Remove markdown code fences
     text = re.sub(r'^```(?:json)?\s*', '', text, flags=re.MULTILINE)
     text = re.sub(r'\s*```\s*$', '', text, flags=re.MULTILINE)
     text = text.strip()
 
-    # Try direct parse first
     if text.startswith("{"):
         try:
             json.loads(text)
@@ -227,43 +163,30 @@ def _extract_json_object(text: str) -> Optional[str]:
         except json.JSONDecodeError:
             pass
 
-    # Extract JSON object using brace matching
     json_text = _extract_balanced_braces(text)
-
     if json_text:
-        # Try parsing as-is
         try:
             json.loads(json_text)
             return json_text
         except json.JSONDecodeError:
             pass
-
-        # Try repair
         repaired = _repair_json(json_text)
         try:
             json.loads(repaired)
-            print("    [JSON] Repaired malformed JSON successfully")
             return repaired
-        except json.JSONDecodeError as e:
-            print(f"    [JSON] Repair attempt 1 failed: {e}")
+        except json.JSONDecodeError:
+            pass
+        aggressive = _aggressive_json_repair(json_text)
+        if aggressive:
+            try:
+                json.loads(aggressive)
+                return aggressive
+            except json.JSONDecodeError:
+                pass
+        truncated = _truncate_to_valid_json(repaired)
+        if truncated:
+            return truncated
 
-            # Try aggressive repair: re-extract values as raw strings
-            aggressive = _aggressive_json_repair(json_text)
-            if aggressive:
-                try:
-                    json.loads(aggressive)
-                    print("    [JSON] Aggressive repair succeeded")
-                    return aggressive
-                except json.JSONDecodeError as e2:
-                    print(f"    [JSON] Aggressive repair failed: {e2}")
-
-            # Last resort: truncation
-            truncated = _truncate_to_valid_json(repaired)
-            if truncated:
-                print("    [JSON] Recovered partial JSON via truncation")
-                return truncated
-
-    # Fallback: regex extraction
     m = re.search(r"(\{.*\})", text, re.DOTALL)
     if m:
         candidate = m.group(1).strip()
@@ -279,116 +202,71 @@ def _extract_json_object(text: str) -> Optional[str]:
                     return aggressive
                 except json.JSONDecodeError:
                     pass
-
     return None
 
 
 def _aggressive_json_repair(text: str) -> Optional[str]:
-    """
-    Aggressive JSON repair: extract key-value pairs using regex patterns
-    and reconstruct a clean JSON object. Handles cases where inner quotes,
-    newlines, and special characters completely break standard parsing.
-    """
     if not text:
         return None
-
-    # Try to extract each top-level key and its value
-    # Pattern matches "key": followed by either a string, array, or object value
-    
-    # First, identify all top-level keys
     key_pattern = re.compile(r'"(\w+)"\s*:\s*', re.DOTALL)
     keys_found = [(m.group(1), m.start(), m.end()) for m in key_pattern.finditer(text)]
-    
     if not keys_found:
         return None
 
     extracted = {}
-    
     for idx, (key, key_start, val_start) in enumerate(keys_found):
-        # Determine where this value ends (next top-level key or end of object)
         if idx + 1 < len(keys_found):
-            # Value ends just before the next key's quote
-            # But we need to find the comma before the next key
             next_key_start = keys_found[idx + 1][1]
-            raw_value = text[val_start:next_key_start].strip()
-            # Remove trailing comma
-            raw_value = raw_value.rstrip().rstrip(',').strip()
+            raw_value = text[val_start:next_key_start].strip().rstrip().rstrip(',').strip()
         else:
-            # Last key - value goes to end of object
-            raw_value = text[val_start:].strip()
-            # Remove trailing braces
-            raw_value = raw_value.rstrip().rstrip('}').rstrip(',').strip()
-
-        # Parse the value based on what it starts with
+            raw_value = text[val_start:].strip().rstrip().rstrip('}').rstrip(',').strip()
         parsed_value = _parse_raw_value(raw_value, key)
         if parsed_value is not None:
             extracted[key] = parsed_value
 
     if not extracted:
         return None
-
     try:
         result = json.dumps(extracted, ensure_ascii=False)
-        json.loads(result)  # Verify it's valid
+        json.loads(result)
         return result
     except (json.JSONDecodeError, TypeError, ValueError):
         return None
 
 
 def _parse_raw_value(raw: str, key: str) -> Any:
-    """Parse a raw JSON value string, handling malformed content."""
     if not raw:
         return "" if key not in ('entities',) else {}
-
     raw = raw.strip()
-
-    # Try direct JSON parse first
     try:
         return json.loads(raw)
     except (json.JSONDecodeError, ValueError):
         pass
-
-    # Array value: [...] 
     if raw.startswith('['):
         return _parse_raw_array(raw)
-
-    # Object value: {...}
     if raw.startswith('{'):
         repaired = _repair_json(raw)
         try:
             return json.loads(repaired)
         except (json.JSONDecodeError, ValueError):
             return {}
-
-    # String value: "..."
     if raw.startswith('"'):
         return _parse_raw_string(raw)
-
-    # Unquoted value - treat as string
     return raw.strip('"').strip()
 
 
 def _parse_raw_array(raw: str) -> List:
-    """Parse a raw array value, handling malformed elements."""
-    # Try direct parse
     try:
         return json.loads(raw)
     except (json.JSONDecodeError, ValueError):
         pass
-
-    # Try repair then parse
     repaired = _repair_json(raw)
     try:
         return json.loads(repaired)
     except (json.JSONDecodeError, ValueError):
         pass
-
-    # Manual extraction: find string elements
     items = []
-    
-    # Check if array contains objects (dicts) or strings
     if '{' in raw:
-        # Array of objects - extract each {...} block
         obj_pattern = re.compile(r'\{([^{}]*)\}')
         for m in obj_pattern.finditer(raw):
             obj_text = '{' + m.group(1) + '}'
@@ -396,7 +274,6 @@ def _parse_raw_array(raw: str) -> List:
             try:
                 items.append(json.loads(repaired_obj))
             except (json.JSONDecodeError, ValueError):
-                # Try to extract key-value pairs manually
                 kv_pattern = re.compile(r'"(\w+)"\s*:\s*"([^"]*)"')
                 obj_dict = {}
                 for kv in kv_pattern.finditer(m.group(1)):
@@ -404,67 +281,48 @@ def _parse_raw_array(raw: str) -> List:
                 if obj_dict:
                     items.append(obj_dict)
     else:
-        # Array of strings - extract quoted strings
         str_pattern = re.compile(r'"((?:[^"\\]|\\.)*)"')
         for m in str_pattern.finditer(raw):
             val = m.group(1).strip()
             if val and len(val) > 3:
                 items.append(val)
-
     return items
 
 
 def _parse_raw_string(raw: str) -> str:
-    """Parse a raw string value, handling unescaped characters."""
-    # Try direct parse
     try:
         return json.loads(raw)
     except (json.JSONDecodeError, ValueError):
         pass
-
-    # Strip outer quotes and clean up
     if raw.startswith('"') and raw.endswith('"'):
         inner = raw[1:-1]
     elif raw.startswith('"'):
-        # Missing closing quote
         inner = raw[1:]
     else:
         inner = raw
-
-    # Escape problematic characters
-    inner = inner.replace('\\', '\\\\')  # Escape backslashes first
+    inner = inner.replace('\\', '\\\\')
     inner = inner.replace('\n', '\\n')
     inner = inner.replace('\r', '')
     inner = inner.replace('\t', '\\t')
-    
-    # Handle unescaped inner quotes - replace with escaped
-    # But we already stripped outer quotes, so all remaining quotes are inner
     inner = inner.replace('"', '\\"')
-
     try:
         return json.loads(f'"{inner}"')
     except (json.JSONDecodeError, ValueError):
-        # Last resort: return cleaned raw text
         return inner.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
 
 
 def _extract_balanced_braces(text: str) -> Optional[str]:
-    """Extract a balanced JSON object by tracking brace depth."""
     start = text.find('{')
     if start == -1:
         return None
-
     depth = 0
     in_string = False
     i = start
-
     while i < len(text):
         ch = text[i]
-
         if ch == '\\' and in_string:
             i += 2
             continue
-
         if ch == '"':
             in_string = not in_string
         elif not in_string:
@@ -475,32 +333,23 @@ def _extract_balanced_braces(text: str) -> Optional[str]:
                 if depth == 0:
                     return text[start:i + 1]
         i += 1
-
-    # If unbalanced, return what we have plus closing braces
     if depth > 0:
         fragment = text[start:]
         fragment = fragment.rstrip().rstrip(',')
         fragment += '}' * depth
         return fragment
-
     return None
 
 
 def _truncate_to_valid_json(text: str) -> Optional[str]:
-    """
-    Progressively truncate JSON to find the largest valid subset.
-    Useful when Gemini truncates the response mid-value.
-    """
     if not text:
         return None
-
-    # Strategy 1: Try removing content from the end to find valid JSON
     for end_pattern in [
-        r',\s*"[^"]*"\s*:\s*(?:"(?:[^"\\]|\\.)*$)',  # Unterminated string value
-        r',\s*"[^"]*"\s*:\s*\[(?:[^\]]*$)',  # Unterminated array
-        r',\s*"[^"]*"\s*:\s*\{(?:[^}]*$)',  # Unterminated object
-        r',\s*"[^"]*"\s*:\s*(?:"[^"]*"|[\[\{]).*$',  # Last incomplete k-v pair
-        r',\s*"[^"]*"\s*:.*$',  # Any trailing incomplete pair
+        r',\s*"[^"]*"\s*:\s*(?:"(?:[^"\\]|\\.)*$)',
+        r',\s*"[^"]*"\s*:\s*\[(?:[^\]]*$)',
+        r',\s*"[^"]*"\s*:\s*\{(?:[^}]*$)',
+        r',\s*"[^"]*"\s*:\s*(?:"[^"]*"|[\[\{]).*$',
+        r',\s*"[^"]*"\s*:.*$',
     ]:
         truncated = re.sub(end_pattern, '', text, flags=re.DOTALL)
         if truncated != text and len(truncated) > 10:
@@ -510,40 +359,28 @@ def _truncate_to_valid_json(text: str) -> Optional[str]:
                 return repaired
             except json.JSONDecodeError:
                 continue
-
-    # Strategy 2: Find the last complete key-value pair by looking for
-    # the last valid comma-separated boundary
-    # Find positions of all top-level commas (not inside strings/nested)
     comma_positions = _find_top_level_commas(text)
-    
-    # Try truncating at each comma from the end
     for pos in reversed(comma_positions):
-        candidate = text[:pos].rstrip() 
-        # Close any open structures
+        candidate = text[:pos].rstrip()
         repaired = _repair_json(candidate)
         try:
             json.loads(repaired)
             return repaired
         except json.JSONDecodeError:
             continue
-
     return None
 
 
 def _find_top_level_commas(text: str) -> List[int]:
-    """Find positions of commas at the top level of a JSON object (depth 1)."""
     positions = []
     depth = 0
     in_string = False
     i = 0
-
     while i < len(text):
         ch = text[i]
-
         if ch == '\\' and in_string:
             i += 2
             continue
-
         if ch == '"':
             in_string = not in_string
         elif not in_string:
@@ -553,9 +390,7 @@ def _find_top_level_commas(text: str) -> List[int]:
                 depth -= 1
             elif ch == ',' and depth == 1:
                 positions.append(i)
-
         i += 1
-
     return positions
 
 
@@ -596,7 +431,6 @@ def _coerce_list_dict(x: Any, keys: Tuple[str, str]) -> List[Dict[str, str]]:
 
 
 def _apply_tone_and_redaction(text: str) -> str:
-    """Apply tone enforcement and PII redaction."""
     if not text:
         return text
     text = enforce_tone(text)
@@ -607,7 +441,6 @@ def _apply_tone_and_redaction(text: str) -> str:
 
 
 def _strip_markdown(text: str) -> str:
-    """Remove all markdown formatting from text."""
     if not text:
         return text
     text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
@@ -620,7 +453,7 @@ def _strip_markdown(text: str) -> str:
 
 
 # ============================================================
-# Call 1: Document Sections
+# Call 1: Document Sections (unchanged logic, same as before)
 # ============================================================
 
 def _generate_document_sections(
@@ -629,7 +462,6 @@ def _generate_document_sections(
 ) -> Dict[str, Any]:
     """
     LLM Call 1: Extract project name + all narrative document sections.
-    Returns dict with project_name, entities, and document sections.
     """
     sample = safe_sample(transcript, max_len=config.llm.max_sample_text)
     doc_type = config.document.document_type
@@ -718,38 +550,38 @@ TRANSCRIPT:
     if json_text:
         try:
             data = json.loads(json_text)
-
             pn = str(data.get("project_name", "")).strip()
             if pn and len(pn) > 3:
                 result["project_name"] = pn
-
             ent = data.get("entities", {})
             if isinstance(ent, dict):
                 for key in ["companies", "applications", "systems", "departments"]:
                     items = ent.get(key, [])
                     if isinstance(items, list):
                         result["entities"][key] = [str(i).strip() for i in items if str(i).strip()]
-
             for key in ["purpose", "overview", "justification", "as_is", "to_be"]:
                 val = str(data.get(key, "")).strip()
                 if val:
                     val = _strip_markdown(val)
                     val = _apply_tone_and_redaction(val)
                     result["document"][key] = val
-
             print(f"    [DocBundle_Sections] Parsed successfully: "
                   f"{sum(1 for v in result['document'].values() if v)}/5 sections")
-
         except json.JSONDecodeError as e:
-            print(f"    [DocBundle_Sections] JSON parse failed after all repair attempts: {e}")
-            result["document"] = _fallback_parse_sections(resp)
-        except Exception as e:
-            print(f"    [DocBundle_Sections] Error: {type(e).__name__}: {e}")
+            print(f"    [DocBundle_Sections] JSON parse failed: {e}")
+            result["document"] = _fallback_parse_sections(resp or "")
     else:
-        print("    [DocBundle_Sections] No JSON found in response, using fallback parser")
-        result["document"] = _fallback_parse_sections(resp)
+        print("    [DocBundle_Sections] No JSON found, using fallback parser")
+        result["document"] = _fallback_parse_sections(resp or "")
 
-    # Ensure all sections have content
+    # Ensure all sections have content — use generic templates
+    _ensure_section_defaults(result)
+
+    return result
+
+
+def _ensure_section_defaults(result: Dict):
+    """Fill empty sections with generic templates based on project name."""
     pn = result["project_name"]
     doc = result["document"]
     doc_full_name = config.document.document_type_full
@@ -763,17 +595,13 @@ TRANSCRIPT:
             f"validation of the automated solution.\n\n"
             f"The scope encompasses the complete end-to-end process flow, including "
             f"system interactions, data handling procedures, validation rules, exception "
-            f"handling scenarios, and expected outputs. The document captures both the "
-            f"current manual state and the target automated state of the {pn} process.\n\n"
-            f"This document applies to all phases of the automation lifecycle, from "
-            f"initial development through testing, deployment, and ongoing maintenance."
+            f"handling scenarios, and expected outputs."
         )
 
     if not doc["overview"] or len(doc["overview"]) < 50:
         doc["overview"] = (
             f"The primary objective of the {pn} automation is to streamline "
-            f"and standardize the existing manual process, ensuring consistency, "
-            f"accuracy, and compliance with established business rules.\n\n"
+            f"and standardize the existing manual process.\n\n"
             f"- The system automates repetitive manual tasks to reduce processing time.\n"
             f"- The system enforces standardized validation rules across all records.\n"
             f"- The system generates comprehensive audit trails for compliance tracking.\n"
@@ -783,56 +611,31 @@ TRANSCRIPT:
 
     if not doc["justification"] or len(doc["justification"]) < 50:
         doc["justification"] = (
-            f"Automating the {pn} process delivers measurable operational value "
-            f"by reducing manual effort, improving accuracy, and ensuring consistent "
-            f"execution across all processing cycles.\n\n"
-            f"1. Reduced Processing Time: The system completes the end-to-end process "
-            f"in minutes compared to hours of manual effort.\n"
-            f"2. Improved Accuracy: The system eliminates manual data entry errors "
-            f"through automated validation and processing.\n"
-            f"3. Enhanced Compliance: The system maintains detailed audit logs for "
-            f"regulatory and governance requirements.\n"
-            f"4. Consistent Execution: The system applies identical business rules "
-            f"to every record, eliminating subjective variation.\n"
-            f"5. Scalability: The system handles increased volume without additional "
-            f"manual resources."
+            f"Automating the {pn} process delivers measurable operational value.\n\n"
+            f"1. Reduced Processing Time - The system completes the process in minutes.\n"
+            f"2. Improved Accuracy - Eliminates manual data entry errors.\n"
+            f"3. Enhanced Compliance - Maintains detailed audit logs.\n"
+            f"4. Consistent Execution - Applies identical business rules to every record.\n"
+            f"5. Scalability - Handles increased volume without additional resources."
         )
 
     if not doc["as_is"] or len(doc["as_is"]) < 50:
         doc["as_is"] = (
-            f"The current {pn} process relies on manual execution by trained operators. "
-            f"The operator logs into the required applications, navigates to the relevant "
-            f"modules, and performs data extraction, validation, and processing tasks "
-            f"by hand.\n\n"
-            f"The manual process requires significant time investment for each processing "
-            f"cycle. The operator must review individual records, cross-reference data "
-            f"across multiple sources, and manually update system records based on the "
-            f"validation results.\n\n"
+            f"The current {pn} process relies on manual execution by trained operators.\n\n"
             f"Business Challenges:\n"
-            f"- High processing time due to manual record-by-record handling.\n"
+            f"- High processing time due to manual handling.\n"
             f"- Risk of human error in data entry and validation.\n"
-            f"- Inconsistent application of business rules across operators.\n"
-            f"- Limited audit trail for compliance verification.\n"
-            f"- Difficulty scaling with increased processing volume."
+            f"- Inconsistent application of business rules.\n"
+            f"- Limited audit trail for compliance verification."
         )
 
     if not doc["to_be"] or len(doc["to_be"]) < 50:
         doc["to_be"] = (
             f"The {pn} automation executes the end-to-end process through a structured "
             f"sequence of system actions. The automation initiates upon a configured "
-            f"trigger, establishes connections to required applications, and processes "
-            f"data according to defined business rules.\n\n"
-            f"The system validates each record against the established criteria, performs "
-            f"the required actions for compliant records, and logs exceptions for "
-            f"non-compliant entries. The automation handles error scenarios through "
-            f"configured retry logic and exception routing.\n\n"
-            f"Upon completion, the system generates a comprehensive execution report "
-            f"detailing processed records, exceptions encountered, and overall "
-            f"processing statistics. The system updates the process status and "
-            f"archives execution logs for audit purposes."
+            f"trigger and processes data according to defined business rules.\n\n"
+            f"Upon completion, the system generates a comprehensive execution report."
         )
-
-    return result
 
 
 def _fallback_parse_sections(raw_text: str) -> Dict[str, str]:
@@ -840,7 +643,6 @@ def _fallback_parse_sections(raw_text: str) -> Dict[str, str]:
     sections = {"purpose": "", "overview": "", "justification": "", "as_is": "", "to_be": ""}
     if not raw_text:
         return sections
-
     raw_text = _strip_markdown(raw_text)
 
     section_patterns = {
@@ -850,19 +652,15 @@ def _fallback_parse_sections(raw_text: str) -> Dict[str, str]:
         ],
         "overview": [
             r'(?:"?overview"?\s*[:=]\s*"?)(.*?)(?="?\s*,?\s*"?(?:justification|as.is|to.be)"?\s*[:=]|\Z)',
-            r'(?:overview|objective)[:\s]*(.*?)(?=justification|as.is|to.be|\Z)',
         ],
         "justification": [
             r'(?:"?justification"?\s*[:=]\s*"?)(.*?)(?="?\s*,?\s*"?(?:as.is|to.be)"?\s*[:=]|\Z)',
-            r'(?:justification|business justification)[:\s]*(.*?)(?=as.is|to.be|\Z)',
         ],
         "as_is": [
             r'(?:"?as.is"?\s*[:=]\s*"?)(.*?)(?="?\s*,?\s*"?(?:to.be)"?\s*[:=]|\Z)',
-            r'(?:as.is|current state|current process)[:\s]*(.*?)(?=to.be|future|\Z)',
         ],
         "to_be": [
             r'(?:"?to.be"?\s*[:=]\s*"?)(.*?)(?="?\s*}|\Z)',
-            r'(?:to.be|future state|automated process)[:\s]*(.*?)$',
         ],
     }
 
@@ -878,12 +676,11 @@ def _fallback_parse_sections(raw_text: str) -> Dict[str, str]:
     found = sum(1 for v in sections.values() if v)
     if found > 0:
         print(f"    [DocBundle_Sections] Fallback parser recovered {found}/5 sections")
-
     return sections
 
 
 # ============================================================
-# Call 2: Process Data (steps, requirements)
+# Call 2: Process Data (steps, requirements) — IMPROVED
 # ============================================================
 
 def _generate_process_data(
@@ -893,28 +690,33 @@ def _generate_process_data(
 ) -> Dict[str, Any]:
     """
     LLM Call 2: Extract process steps, detailed steps, and all requirements tables.
+    Enhanced prompts to capture sub-steps, conditionals, loops, data operations.
     """
     sample = safe_sample(transcript, max_len=config.llm.max_sample_text)
+    min_steps = config.llm.min_process_steps
+    max_steps = config.llm.max_process_steps
+    min_detailed = config.llm.min_detailed_steps
+    max_detailed = config.llm.max_detailed_steps
 
     apps_hint = ""
     if entities.get("applications"):
         apps_hint = f"Applications mentioned: {', '.join(entities['applications'])}"
 
-    prompt = f"""You are a senior Business Analyst extracting automation process data.
+    prompt = f"""You are a senior Business Analyst extracting automation process data from a meeting transcript.
 
 Project: "{project_name}"
 {apps_hint}
 
-TASK: Extract ALL process steps and requirements from this transcript.
+TASK: Extract ALL process steps and requirements. Be EXHAUSTIVE — capture every action, decision, validation, loop, and data operation discussed.
 
 OUTPUT STRICT JSON with this exact structure:
 
 {{
   "process_steps": [
-    "Step description starting with a verb (8-15 items)"
+    "High-level step description ({min_steps}-{max_steps} items)"
   ],
   "detailed_steps": [
-    "Detailed screen-level action description (15-25 items)"
+    "Granular screen-level action description ({min_detailed}-{max_detailed} items)"
   ],
   "input_requirements": [
     {{"parameter": "Parameter Name", "description": "What it is and why needed"}}
@@ -927,25 +729,39 @@ OUTPUT STRICT JSON with this exact structure:
   ]
 }}
 
-DETAILED INSTRUCTIONS:
+CRITICAL STEP EXTRACTION RULES:
 
-process_steps (8-15 items):
-- High-level automation steps, each starting with an action verb.
-- Examples: "Connect to the application using credentials",
-  "Navigate to the data module", "Extract records from source",
-  "Validate records against criteria", "Generate execution report"
+For process_steps ({min_steps}-{max_steps} items):
+- Each step starts with an action verb: Access, Navigate, Export, Filter, Validate, Execute, Capture, Update, Generate, Repeat
+- Include steps for: login/authentication, navigation, data export, data cleaning/filtering, validation/verification, conditional actions, iterative/repeated actions, reporting, logout
+- If the process is performed for MULTIPLE systems/portals, include separate steps for each
+- Include data manipulation steps: filtering, deduplication, extraction of specific columns
+- Include validation/decision steps: checking status, verifying conditions
+- Include reporting/logging steps: capturing counts, updating status, generating reports
 
-detailed_steps (15-25 items):
-- Screen-level actions for PDD Section 2.4.
-- Each describes ONE specific action: login, navigate, click, enter data,
-  download, process, validate, export, report, logout.
-- Each starts with "The system" or "The automation".
-- Examples: "The system opens the target application login page",
-  "The system enters the configured credentials and clicks Sign In",
-  "The system navigates to the Reports tab in the main menu"
+For detailed_steps ({min_detailed}-{max_detailed} items):
+- These are screen-level actions for PDD Section 2.4
+- Each describes ONE specific UI action or system operation
+- MUST include ALL of these action types when discussed in the transcript:
+  a) Login and authentication steps (entering credentials, SSO, MFA)
+  b) Navigation steps (clicking tabs, selecting menus, choosing options from dropdowns)
+  c) Data export/download steps (clicking export, selecting format, downloading files)
+  d) Data manipulation steps (opening files, applying filters, removing blanks, removing duplicates, extracting columns)
+  e) Validation steps (checking each record against a system, querying status)
+  f) Conditional/decision steps (if account is disabled then remove license, if data is blank then skip)
+  g) Action execution steps (removing/revoking/assigning items, clicking buttons)
+  h) Iteration/loop steps (repeating for each team/contract/user, processing next record)
+  i) Post-action capture steps (recording counts, noting remaining items, capturing status)
+  j) Reporting steps (updating tracking files, recording success/failure, saving reports)
+  k) Sharing/distribution steps (saving to shared paths, sending reports)
+  l) Logout/cleanup steps
+- Write in imperative tone. Start each step with an action verb (e.g., Log in, Navigate, Click, Select).
+- Be SPECIFIC: mention exact UI elements, button names, column names, dropdown values when discussed
+- For loops/iterations: explicitly state "Repeat steps X through Y for each..."
+- For conditionals: explicitly state "If [condition], [action]. Otherwise, [alternative]."
 
 input_requirements (5-10 items):
-- Parameters needed: credentials, URLs, file paths, config values.
+- Parameters needed: credentials, URLs, file paths, scripts, configuration values.
 - NEVER include actual passwords or personal data.
 
 interface_requirements (3-8 items):
@@ -954,18 +770,18 @@ interface_requirements (3-8 items):
 
 exception_handling (6-10 items):
 - Error scenarios with system response.
-- Include: login failure, timeout, missing data, validation error, system crash.
+- Include: login failure, timeout, missing data, validation error, system crash, script error, file access denied.
 - Handling must be in third person: "The system retries...", "The system logs..."
 
 CRITICAL JSON RULES:
 - Use ONLY application names from the transcript.
 - NEVER mention the meeting, transcript, or speakers.
 - NEVER include personal names, emails, or phone numbers.
-- Third person, present tense, active voice.
+- Write in imperative tone, present tense, active voice.
 - DO NOT use markdown formatting.
-- IMPORTANT: Keep all string values on a SINGLE LINE. No literal line breaks inside strings.
-- IMPORTANT: Escape any double quotes inside strings with backslash: \\"
-- Output STRICT valid JSON only. No text before or after the JSON object.
+- Keep all string values on a SINGLE LINE.
+- Escape any double quotes inside strings with backslash: \\"
+- Output STRICT valid JSON only.
 
 TRANSCRIPT:
 {sample}
@@ -992,79 +808,79 @@ TRANSCRIPT:
     if json_text:
         try:
             data = json.loads(json_text)
-
             result["process_steps"] = _coerce_list_str(data.get("process_steps"))
             result["detailed_steps"] = _coerce_list_str(data.get("detailed_steps"))
             result["input_requirements"] = _coerce_list_dict(
-                data.get("input_requirements"), ("parameter", "description")
-            )
+                data.get("input_requirements"), ("parameter", "description"))
             result["interface_requirements"] = _coerce_list_dict(
-                data.get("interface_requirements"), ("application", "purpose")
-            )
+                data.get("interface_requirements"), ("application", "purpose"))
             result["exception_handling"] = _coerce_list_dict(
-                data.get("exception_handling"), ("exception", "handling")
-            )
-
+                data.get("exception_handling"), ("exception", "handling"))
             print(f"    [DocBundle_ProcessData] Parsed: "
                   f"{len(result['process_steps'])} steps, "
                   f"{len(result['detailed_steps'])} detailed, "
                   f"{len(result['input_requirements'])} inputs, "
                   f"{len(result['interface_requirements'])} interfaces, "
                   f"{len(result['exception_handling'])} exceptions")
-
         except json.JSONDecodeError as e:
-            print(f"    [DocBundle_ProcessData] JSON parse failed after all repairs: {e}")
-            result = _fallback_parse_process_data(resp)
-        except Exception as e:
-            print(f"    [DocBundle_ProcessData] Error: {type(e).__name__}: {e}")
+            print(f"    [DocBundle_ProcessData] JSON parse failed: {e}")
+            result = _fallback_parse_process_data(resp or "")
     else:
         print("    [DocBundle_ProcessData] No JSON found, using fallback parser")
-        result = _fallback_parse_process_data(resp)
+        result = _fallback_parse_process_data(resp or "")
 
-    # Redact PII from all text
+    # Redact PII
     result["process_steps"] = [redact_pii_text(s) for s in result["process_steps"]]
     result["detailed_steps"] = [redact_pii_text(s) for s in result["detailed_steps"]]
 
     # Apply fallbacks for empty sections
+    _ensure_process_data_defaults(result, entities)
+
+    return result
+
+
+def _ensure_process_data_defaults(result: Dict, entities: Dict):
+    """Fill empty process data with generic templates."""
+    apps = ', '.join(entities.get('applications', [])) or 'the target application'
+
     if not result["process_steps"]:
-        apps = ', '.join(entities.get('applications', [])) or 'the target application'
         result["process_steps"] = [
-            f"The system connects to {apps} using authorized credentials.",
-            f"The system navigates to the relevant processing module within {apps}.",
-            "The system extracts the required data from the configured source.",
-            "The system filters records based on the defined business criteria.",
-            "The system validates each record against the established rules.",
-            f"The system performs the required processing actions in {apps}.",
-            "The system captures the updated status for each processed item.",
-            "The system generates a comprehensive execution report.",
-            "The system updates the process status and logs execution details.",
+            f"Connect to {apps} using authorized credentials.",
+            f"Navigate to the relevant processing module within {apps}.",
+            "Extract the required data from the configured source.",
+            "Filter records based on the defined business criteria.",
+            "Validate each record against the established rules.",
+            f"Perform the required processing actions in {apps}.",
+            "Capture and record the updated status for each processed item.",
+            "Generate a comprehensive execution report.",
+            "Update the process status and log all execution details.",
         ]
         print("    [DocBundle_ProcessData] Using fallback process steps")
 
     if not result["detailed_steps"]:
         result["detailed_steps"] = [
-            "The system opens the target application and navigates to the login page.",
-            "The system enters the configured credentials and authenticates.",
-            "The system navigates to the main processing module.",
-            "The system selects the appropriate data source or report.",
-            "The system applies the configured filters and criteria.",
-            "The system extracts the matching records from the source.",
-            "The system validates each record against the defined business rules.",
-            "The system flags records that fail validation checks.",
-            "The system processes each validated record according to the workflow.",
-            "The system updates the record status after processing.",
-            "The system captures processing results and timestamps.",
-            "The system generates a summary report of all processed records.",
-            "The system exports the report to the configured output location.",
-            "The system logs all execution details for audit purposes.",
-            "The system closes the application and terminates the session.",
+            f"Open {apps} and navigate to the login page.",
+            "Enter the configured credentials and authenticate.",
+            "Navigate to the main processing module.",
+            "Select the appropriate data source or report.",
+            "Apply the configured filters and criteria.",
+            "Extract the matching records from the source.",
+            "Validate each record against the defined business rules.",
+            "Flag records that fail validation checks.",
+            "Process each validated record according to the workflow.",
+            "Update the record status after processing.",
+            "Capture processing results and timestamps.",
+            "Generate a summary report of all processed records.",
+            "Export the report to the configured output location.",
+            "Log all execution details for audit purposes.",
+            f"Close {apps} and terminate the session.",
         ]
         print("    [DocBundle_ProcessData] Using fallback detailed steps")
 
     if not result["input_requirements"]:
         result["input_requirements"] = [
-            {"parameter": "Application URL", "description": "Web address of the target application portal."},
-            {"parameter": "User Credentials", "description": "Username and password for secure application access."},
+            {"parameter": "Application URL", "description": f"Web address of {apps}."},
+            {"parameter": "User Credentials", "description": "Username and password for secure access."},
             {"parameter": "Input Data Source", "description": "File path or database connection for source data."},
             {"parameter": "Processing Criteria", "description": "Business rules and filters for record selection."},
             {"parameter": "Output Location", "description": "File path or destination for generated reports."},
@@ -1089,31 +905,23 @@ TRANSCRIPT:
              "handling": "The system captures error details, saves a diagnostic screenshot, and terminates gracefully."},
         ]
 
-    return result
-
 
 def _fallback_parse_process_data(raw_text: str) -> Dict[str, Any]:
     """Parse process data from non-JSON response."""
     result = {
-        "process_steps": [],
-        "detailed_steps": [],
-        "input_requirements": [],
-        "interface_requirements": [],
+        "process_steps": [], "detailed_steps": [],
+        "input_requirements": [], "interface_requirements": [],
         "exception_handling": [],
     }
     if not raw_text:
         return result
-
     raw_text = _strip_markdown(raw_text)
-
     lines = raw_text.split('\n')
     current_section = None
 
     for line in lines:
         line = line.strip()
         lower = line.lower()
-
-        # Detect section headers
         if 'process_step' in lower or 'process step' in lower:
             current_section = 'process_steps'
             continue
@@ -1129,53 +937,140 @@ def _fallback_parse_process_data(raw_text: str) -> Dict[str, Any]:
         elif 'exception' in lower and ('handl' in lower or ':' in line):
             current_section = 'exception_handling'
             continue
-
         if not line or not current_section:
             continue
-
-        # Parse numbered/bulleted items
         cleaned = re.sub(r'^[\d]+[\.\)]\s*', '', line).strip()
         cleaned = re.sub(r'^[-•*]\s*', '', cleaned).strip()
         cleaned = cleaned.strip('"')
-
         if len(cleaned) < 10:
             continue
-
         if current_section in ('process_steps', 'detailed_steps'):
             result[current_section].append(cleaned)
         elif current_section == 'input_requirements':
             if '|' in cleaned:
                 parts = cleaned.split('|', 1)
                 result[current_section].append({
-                    "parameter": parts[0].strip(),
-                    "description": parts[1].strip() if len(parts) > 1 else ""
-                })
-            elif ':' in cleaned:
-                parts = cleaned.split(':', 1)
-                result[current_section].append({
-                    "parameter": parts[0].strip(),
-                    "description": parts[1].strip() if len(parts) > 1 else ""
-                })
+                    "parameter": parts[0].strip(), "description": parts[1].strip() if len(parts) > 1 else ""})
         elif current_section == 'interface_requirements':
             if '|' in cleaned:
                 parts = cleaned.split('|', 1)
                 result[current_section].append({
-                    "application": parts[0].strip(),
-                    "purpose": parts[1].strip() if len(parts) > 1 else ""
-                })
+                    "application": parts[0].strip(), "purpose": parts[1].strip() if len(parts) > 1 else ""})
         elif current_section == 'exception_handling':
             if '|' in cleaned:
                 parts = cleaned.split('|', 1)
                 result[current_section].append({
-                    "exception": parts[0].strip(),
-                    "handling": parts[1].strip() if len(parts) > 1 else ""
-                })
+                    "exception": parts[0].strip(), "handling": parts[1].strip() if len(parts) > 1 else ""})
 
     found_sections = sum(1 for v in result.values() if v)
     if found_sections > 0:
         print(f"    [DocBundle_ProcessData] Fallback parser recovered {found_sections}/5 sections")
-
     return result
+
+
+# ============================================================
+# Call 3: Step Refinement (NEW)
+# ============================================================
+
+# (Find the _refine_detailed_steps function in llm_tasks/meeting_compact.py and replace it)
+
+def _refine_detailed_steps(
+    transcript: str,
+    project_name: str,
+    coarse_steps: List[str],
+    entities: Dict
+) -> List[str]:
+    """
+    LLM Call 3: Expand coarse detailed steps into granular, EXACT UI sub-steps.
+    Decomposes each step that implies multiple actions into explicit sub-steps.
+    """
+    if not coarse_steps:
+        return coarse_steps
+
+    if not config.llm.enable_step_refinement:
+        print("    [StepRefine] Step refinement disabled")
+        return coarse_steps
+
+    min_target = config.llm.min_refined_steps
+    max_target = config.llm.max_refined_steps
+
+    sample = safe_sample(transcript, max_len=config.llm.max_sample_text)
+
+    apps_hint = ""
+    if entities.get("applications"):
+        apps_hint = f"Applications: {', '.join(entities['applications'])}"
+
+    steps_block = "\n".join(f"{i+1}. {s}" for i, s in enumerate(coarse_steps))
+
+    prompt = f"""You are a strict, robotic Technical Writer refining process steps for a Process Definition Document (PDD).
+
+Project: "{project_name}"
+{apps_hint}
+
+Below are coarse process steps extracted from a transcript. DECOMPOSE them into highly granular, mechanical UI steps.
+
+CURRENT COARSE STEPS:
+{steps_block}
+
+CRITICAL MECHANICAL RULES (NO EXCEPTIONS):
+1. ABSOLUTELY NO NARRATIVE FLUFF. Do NOT write "in the primary navigation menu" or "to complete the process". Just state the action.
+2. COMBINE related navigation and selections using breadcrumbs (`->`) and commas. 
+   Format: "Go to [Menu] -> [SubMenu], select [Dropdown] -> [Value], then click [Button]."
+3. Quote EXACT text for buttons, tabs, dropdowns, and checkboxes mentioned in the transcript.
+4. Do NOT skip intermediate file operations. Use: "Click 'Download' and open the file."
+5. Every step MUST start with an action verb (e.g., Log in, Navigate, Click, Select). Do NOT start with "The system...".
+
+=== STRICT FORMATTING EXAMPLES ===
+BAD (Fluff): "The system navigates to the user management in the primary menu."
+GOOD (Mechanical): "Navigate to the 'User Management' tab."
+
+BAD (Too wordy): "The system clicks the team selection dropdown menu to view the list and selects the group."
+GOOD (Mechanical): "Go to User Management -> By User, select Team -> 'Regional Group A', then click 'Export'."
+
+BAD (Abstract): "The system filters the file."
+GOOD (Mechanical): "Open the downloaded file, under 'Categories' select 'Users', then click 'Export'."
+
+BAD (Narrative): "The system clicks download to get the file."
+GOOD (Mechanical): "Click 'Download' and open the file."
+============================
+
+REFERENCE TRANSCRIPT (for context and exact UI wording):
+{sample[:8000]}
+
+OUTPUT: Numbered list of refined steps only. Target {min_target}-{max_target} steps.
+1."""
+
+    resp = gemini_client.generate(
+        prompt=prompt,
+        system_prompt=get_system_prompt(),
+        temperature=0.1, # Extremely low temperature to force strict adherence to format
+        max_output_tokens=config.llm.max_output_tokens,
+        call_name="DocBundle_StepRefine",
+        max_retries=3
+    )
+
+    refined = []
+    if resp:
+        if not resp.strip().startswith("1"):
+            resp = "1. " + resp
+
+        from core.utils import parse_numbered_steps, filter_conversation_steps, deduplicate_steps
+        parsed = parse_numbered_steps(resp)
+        parsed = filter_conversation_steps(parsed)
+        parsed = [redact_pii_text(s) for s in parsed]
+        parsed = deduplicate_steps(parsed)
+
+        if len(parsed) >= len(coarse_steps):
+            refined = parsed
+            print(f"    [StepRefine] Refined {len(coarse_steps)} -> {len(refined)} exact UI steps")
+        else:
+            print(f"    [StepRefine] Refinement produced fewer steps ({len(parsed)}), keeping originals")
+            refined = coarse_steps
+    else:
+        print("    [StepRefine] No response, keeping original steps")
+        refined = coarse_steps
+
+    return refined
 
 
 # ============================================================
@@ -1187,22 +1082,32 @@ def generate_doc_bundle_from_transcript(
     project_name_hint: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Two consolidated LLM calls to extract ALL PDD content.
+    Three consolidated LLM calls to extract ALL PDD content.
     Call 1: Document narrative sections
     Call 2: Process steps and requirements tables
+    Call 3: Step refinement — decompose coarse steps into granular sub-steps
     """
     start = time.time()
 
     # Call 1: Sections
-    print("    [DocBundle] Call 1/2: Document sections...")
+    print("    [DocBundle] Call 1/3: Document sections...")
     sections_result = _generate_document_sections(transcript, project_name_hint)
 
     project_name = sections_result["project_name"]
     entities = sections_result["entities"]
 
     # Call 2: Process data
-    print("    [DocBundle] Call 2/2: Process steps & requirements...")
+    print("    [DocBundle] Call 2/3: Process steps & requirements...")
     process_result = _generate_process_data(transcript, project_name, entities)
+
+    # Call 3: Step refinement
+    print("    [DocBundle] Call 3/3: Step refinement...")
+    refined_detailed = _refine_detailed_steps(
+        transcript, project_name,
+        process_result["detailed_steps"],
+        entities
+    )
+    process_result["detailed_steps"] = refined_detailed
 
     # Combine
     result = {
@@ -1231,7 +1136,7 @@ def generate_dot_from_transcript(
 ) -> str:
     """
     Single LLM call to generate DOT flowchart code.
-    Enforces short labels (max 5 words per node).
+    Enhanced to include decision diamonds, loops, and parallel paths.
     """
     start = time.time()
     sample = safe_sample(transcript, max_len=config.llm.max_sample_text)
@@ -1239,7 +1144,7 @@ def generate_dot_from_transcript(
     steps_block = ""
     if process_steps:
         steps_block = "PROCESS STEPS (use these as nodes):\n" + "\n".join(
-            f"{i+1}. {s[:80]}" for i, s in enumerate(process_steps[:18])
+            f"{i+1}. {s[:100]}" for i, s in enumerate(process_steps[:20])
         )
 
     max_words = config.flowchart.max_label_words
@@ -1256,14 +1161,21 @@ STRICT FORMATTING RULES:
 3. Must include Start (oval, green) and End (oval, red) nodes.
 4. Use rankdir=TB.
 5. Every node label MUST be MAX {max_words} WORDS. Short verb+object phrases only.
-   GOOD: "Login to Portal", "Validate Records", "Export Report"
+   GOOD: "Login to Portal", "Export User List", "Validate in AD", "Remove License"
    BAD: "The system validates each record against the defined criteria"
-6. Use diamond shape for decisions, box for steps.
-7. Colors: process=lightblue, decision=gold, start=lightgreen, end=lightcoral.
-8. All nodes must have style=filled.
+6. Use diamond shape for DECISION NODES where the process branches based on a condition.
+   Decision nodes should have Yes/No or True/False edge labels.
+   Examples of decisions: "Account Disabled?", "Valid User?", "More Items?", "Export Success?"
+7. Use box shape for process steps.
+8. Colors: process=lightblue, decision=gold, start=lightgreen, end=lightcoral.
+9. All nodes must have style=filled.
+10. Include LOOP STRUCTURES: when a set of steps repeats for each item, add a decision diamond that loops back.
+    Example: after processing a user, add "More Users?" diamond that goes back to the processing step (Yes) or forward (No).
+11. Include PARALLEL PATHS: if the process handles multiple systems (e.g., two portals), show the flow going through one then the other.
+12. Both branches of a decision should eventually reconnect to the main flow or lead to End.
 
 TRANSCRIPT (context only):
-{sample[:3000]}
+{sample[:4000]}
 """
 
     resp = gemini_client.generate(
@@ -1289,7 +1201,7 @@ TRANSCRIPT (context only):
     return dot
 
 
-def _enforce_short_labels(dot_code: str, max_words: int = 5) -> str:
+def _enforce_short_labels(dot_code: str, max_words: int = 6) -> str:
     """Post-process DOT code to enforce short labels."""
     if not dot_code:
         return dot_code

@@ -588,9 +588,9 @@ class PDDGenerator:
             self._table([
                 ["Exception Scenario", "Handling Action"],
                 ["Application Login Failure",
-                 "The system stops execution, logs the error, and sends a notification."],
+                 "Stop execution, log the error, and send a notification."],
                 ["Record Not Found",
-                 "The system logs the failure, skips the record, and continues processing."],
+                 "Log the failure, skip the record, and continue processing."],
             ], widths=[2.5, 4.5])
 
         # Save

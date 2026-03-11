@@ -8,9 +8,10 @@ Consolidated flow (3 LLM calls):
 1. Extract audio / use provided transcript
 2. LLM Call 1: Document sections
 3. LLM Call 2: Process steps & requirements
-4. LLM Call 3: DOT flowchart
-5. Extract frames & attach to steps
-6. Assemble PDD document
+4. LLM Call 3: Step refinement — decompose into granular sub-steps
+5. LLM Call 4: DOT flowchart
+6. Extract frames & attach to steps
+7. Assemble PDD document
 """
 
 import os
@@ -52,10 +53,7 @@ class AudioPipeline:
         frames_dir: str,
         num_frames: int
     ) -> List[Tuple[str, float]]:
-        """
-        Extract evenly spaced frames across the entire video.
-        Returns list of (frame_path, timestamp) tuples.
-        """
+        """Extract evenly spaced frames across the entire video."""
         import cv2
 
         os.makedirs(frames_dir, exist_ok=True)
@@ -76,7 +74,6 @@ class AudioPipeline:
 
         print(f"    [Frames] Video: {duration:.0f}s, extracting {num_frames} frames...")
 
-        # Skip first 2% and last 2%
         start_t = duration * 0.02
         end_t = duration * 0.98
         interval = (end_t - start_t) / (num_frames + 1)
@@ -99,9 +96,7 @@ class AudioPipeline:
                 frame_path = os.path.join(frames_dir, filename)
                 cv2.imwrite(frame_path, frame)
 
-                # Redact PII
                 redact_pii_from_image(frame_path)
-
                 frames.append((frame_path, timestamp))
 
         cap.release()
@@ -115,15 +110,11 @@ class AudioPipeline:
         frames_dir: str,
         max_frames: int = 30
     ) -> List[Tuple[str, float, str]]:
-        """
-        Extract frames at transcript action keyword timestamps.
-        Returns list of (frame_path, timestamp, transcript_text) tuples.
-        """
+        """Extract frames at transcript action keyword timestamps."""
         import cv2
 
         os.makedirs(frames_dir, exist_ok=True)
 
-        # Parse transcript timestamps
         lines = []
         try:
             with open(transcript_path, 'r', encoding='utf-8') as f:
@@ -144,7 +135,6 @@ class AudioPipeline:
         if not lines:
             return []
 
-        # Find action keyword timestamps
         from core.config import ACTION_KEYWORDS
         all_kw = set()
         for kl in ACTION_KEYWORDS.values():
@@ -159,18 +149,15 @@ class AudioPipeline:
         if not action_lines:
             return []
 
-        # Deduplicate close timestamps (min 3s apart)
         deduped = [action_lines[0]]
         for al in action_lines[1:]:
             if al["timestamp"] - deduped[-1]["timestamp"] > 3.0:
                 deduped.append(al)
 
-        # Limit
         if len(deduped) > max_frames:
             step = len(deduped) // max_frames
             deduped = deduped[::step][:max_frames]
 
-        # Extract frames
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             return []
@@ -202,33 +189,24 @@ class AudioPipeline:
         frames: List[Tuple[str, float]],
         detailed_dicts: List[Dict],
     ) -> Dict[str, str]:
-        """
-        Assign frames to detailed steps by distributing evenly.
-        Returns dict of {step_number_str: frame_path}.
-
-        Simple chronological assignment: spread N frames across M steps.
-        """
+        """Assign frames to detailed steps by distributing evenly."""
         if not frames or not detailed_dicts:
             return {}
 
         num_steps = len(detailed_dicts)
         num_frames = len(frames)
 
-        # Sort frames by timestamp
         sorted_frames = sorted(frames, key=lambda x: x[1])
 
         assigned = {}
 
         if num_frames >= num_steps:
-            # More frames than steps: pick evenly spaced frames
             for i, step in enumerate(detailed_dicts):
                 frame_idx = int(i * num_frames / num_steps)
                 frame_idx = min(frame_idx, num_frames - 1)
                 step_num = step.get("number", f"2.4.{i+1}")
                 assigned[str(step_num)] = sorted_frames[frame_idx][0]
         else:
-            # Fewer frames than steps: assign frames to first N steps,
-            # then spread remaining steps without frames
             interval = max(1, num_steps // num_frames)
             frame_idx = 0
             for i, step in enumerate(detailed_dicts):
@@ -247,18 +225,7 @@ class AudioPipeline:
         whisper_model: str = None,
         transcript_path: str = None
     ) -> Optional[str]:
-        """
-        Process a meeting recording into a PDD document.
-
-        Args:
-            video_path: Path to video file.
-            project_name: Optional project name (auto-detected if None).
-            whisper_model: Whisper model size override.
-            transcript_path: Pre-existing transcript (skips Whisper).
-
-        Returns:
-            Path to generated document, or None on failure.
-        """
+        """Process a meeting recording into a PDD document."""
         t0 = time.time()
         tracker = reset_tracker()
         gemini_client.set_tracker(tracker)
@@ -268,7 +235,7 @@ class AudioPipeline:
             video_path=video_path,
             project_name=project_name or "(auto-detect)",
             extra_info={
-                "Mode": "Consolidated (3 LLM calls)",
+                "Mode": "Consolidated (3-4 LLM calls)",
             }
         )
 
@@ -296,8 +263,8 @@ class AudioPipeline:
             return None
         print(f"  Transcript: {len(transcript):,} chars")
 
-        # ── Step 2: Consolidated LLM Calls (2 calls) ──
-        print("\n[2/4] Consolidated LLM extraction (2 calls)...")
+        # ── Step 2: Consolidated LLM Calls (3 calls) ──
+        print("\n[2/4] Consolidated LLM extraction (3 calls)...")
         t = time.time()
 
         bundle = generate_doc_bundle_from_transcript(
@@ -330,7 +297,6 @@ class AudioPipeline:
         # ── Step 3: Flowchart + Frame Extraction ──
         print("\n[3/4] Flowchart & screenshots...")
 
-        # DOT flowchart
         t = time.time()
         dot_code = generate_dot_from_transcript(
             transcript, project_name, process_steps
@@ -348,12 +314,11 @@ class AudioPipeline:
 
         # Extract frames
         frames_dir = os.path.join(self.output_dir, "frames")
-        all_frames = []  # List of (path, timestamp)
+        all_frames = []
 
         if os.path.exists(video_path) and detailed_dicts:
             t = time.time()
 
-            # Strategy 1: Keyword frames from transcript
             if transcript_path and os.path.exists(transcript_path):
                 kw_frames = self._extract_keyword_frames(
                     video_path, transcript_path, frames_dir,
@@ -362,7 +327,6 @@ class AudioPipeline:
                 for fp, ts, _ in kw_frames:
                     all_frames.append((fp, ts))
 
-            # Strategy 2: Fill with evenly spaced frames
             target_total = max(len(detailed_dicts), 15)
             remaining_needed = target_total - len(all_frames)
 
@@ -370,7 +334,6 @@ class AudioPipeline:
                 even_frames = self._extract_evenly_spaced_frames(
                     video_path, frames_dir, num_frames=remaining_needed
                 )
-                # Only add frames that aren't too close to existing ones
                 existing_timestamps = set(ts for _, ts in all_frames)
                 for fp, ts in even_frames:
                     if not any(abs(ts - et) < 2.0 for et in existing_timestamps):
@@ -379,10 +342,8 @@ class AudioPipeline:
 
             print(f"  Total frames extracted: {len(all_frames)} ({time.time()-t:.0f}s)")
 
-            # Assign frames to steps
             step_frame_map = self._assign_frames_to_steps(all_frames, detailed_dicts)
 
-            # Update detailed_dicts with frame paths
             for step in detailed_dicts:
                 step_num = step.get("number", "")
                 frame_path = step_frame_map.get(str(step_num), "")
@@ -399,13 +360,11 @@ class AudioPipeline:
                 for i, s in enumerate(process_steps)
             ]
 
-        # Build annotated_frames dict for the generator
         annotated_frames = {}
         for step in detailed_dicts:
             step_num = step.get("number", "")
             frame_path = step.get("frame_after_path", "")
             if frame_path and os.path.exists(frame_path):
-                # Extract numeric part for dict key
                 try:
                     num_key = int(str(step_num).split('.')[-1])
                     annotated_frames[num_key] = frame_path
@@ -434,7 +393,6 @@ class AudioPipeline:
 
         persistent = save_persistent_document(doc_path, project_name)
 
-        # Token report
         tracker.print_report()
         tracker.save_csv(project_name)
 

@@ -307,12 +307,12 @@ def enforce_tone(text: str) -> str:
 def _first_to_third(word: str) -> str:
     """Convert first-person pronoun to third-person equivalent."""
     mapping = {
-        'i': 'the system', 'I': 'The system',
-        'we': 'the system', 'We': 'The system',
+        'i': '', 'I': '',
+        'we': '', 'We': '',
         'my': 'the', 'My': 'The',
         'our': 'the', 'Our': 'The',
-        'me': 'the system', 'Me': 'The system',
-        'us': 'the system', 'Us': 'The system',
+        'me': '', 'Me': '',
+        'us': '', 'Us': '',
         'myself': 'itself', 'ourselves': 'itself',
     }
     return mapping.get(word, word)
@@ -375,27 +375,55 @@ def verify_entities_against_transcript(entities: Dict, transcript: str) -> Dict:
 # Step Parsing and Filtering
 # ============================================================
 
+# Only filter out pure coordination/meeting-scheduling steps,
+# NOT steps that contain valid process action verbs
 CONVERSATION_PHRASES = [
-    'coordinate with', 'talk to', 'discuss with', 'meet with',
-    'call ', 'email to', 'notify person', 'inform team',
-    'schedule meeting', 'follow up with', 'follow-up with',
-    'check with person', 'ask team', 'agreed to', 'decided to',
-    'team will', 'we will', 'stakeholder meeting', 'agenda',
-    'let me know', 'get back to', 'circle back', 'touch base',
-    'set up a call', 'send invite', 'book a meeting'
+    'schedule meeting', 'set up a call', 'send invite',
+    'book a meeting', 'touch base', 'circle back',
+    'let me know', 'get back to', 'agenda item',
+    'stakeholder meeting',
+]
+
+# Phrases that should NEVER be filtered even if they contain
+# words that might look conversational
+PROCESS_PRESERVE_PHRASES = [
+    'check', 'verify', 'validate', 'filter', 'export', 'extract',
+    'download', 'upload', 'navigate', 'click', 'select', 'enter',
+    'login', 'log in', 'log out', 'logout', 'open', 'close',
+    'save', 'update', 'remove', 'delete', 'create', 'generate',
+    'process', 'submit', 'confirm', 'apply', 'search', 'copy',
+    'paste', 'repeat', 'iterate', 'loop', 'for each', 'if ',
+    'capture', 'record', 'log ', 'track', 'report', 'status',
+    'revoke', 'assign', 'unassign', 'disable', 'enable',
+    'query', 'script', 'execute', 'run', 'trigger',
 ]
 
 
 def filter_conversation_steps(steps: List[str]) -> List[str]:
-    """Remove steps that describe conversations/meetings, not process actions."""
+    """
+    Remove steps that describe pure conversations/meetings, not process actions.
+    Much less aggressive than before — preserves steps with process action verbs.
+    """
     filtered = []
     for s in steps:
         s_lower = s.lower()
-        if not any(phrase in s_lower for phrase in CONVERSATION_PHRASES):
+
+        # Always keep if it contains process action verbs
+        has_process_action = any(phrase in s_lower for phrase in PROCESS_PRESERVE_PHRASES)
+        if has_process_action:
             filtered.append(s)
-        else:
+            continue
+
+        # Only remove if it matches pure conversation phrases
+        is_conversation = any(phrase in s_lower for phrase in CONVERSATION_PHRASES)
+        if is_conversation:
             print(f"    [Filter] Removed conversation step: '{s[:60]}...'")
-    return filtered if filtered else steps[:8]
+            continue
+
+        # Keep by default
+        filtered.append(s)
+
+    return filtered if filtered else steps
 
 
 def parse_numbered_steps(text: str) -> List[str]:
@@ -412,10 +440,9 @@ def parse_numbered_steps(text: str) -> List[str]:
             continue
         skip = [
             'here are', 'following', 'process steps', 'transcript',
-            'note:', 'section', 'based on', 'the above', 'these are',
+            'note:', 'based on', 'the above', 'these are',
             'below', 'i have', 'let me', 'sure,', 'certainly',
-            'wrong', 'correct', 'critical', 'example',
-            'important', 'context', 'the meeting', 'discussed',
+            'wrong', 'correct', 'example',
             'use only', 'names from'
         ]
         if any(cleaned.lower().startswith(p) for p in skip):
@@ -429,14 +456,44 @@ def parse_numbered_steps(text: str) -> List[str]:
 
 
 def deduplicate_steps(steps: List[str]) -> List[str]:
-    """Remove near-duplicate steps."""
-    seen: Set[str] = set()
+    """
+    Remove near-duplicate steps.
+    Less aggressive — requires higher similarity threshold and
+    preserves steps that act on different targets.
+    """
+    if len(steps) <= 1:
+        return steps
+
     unique = []
     for s in steps:
-        key = re.sub(r'[^a-z]', '', s.lower())[:40]
-        if key not in seen and len(key) > 5:
-            seen.add(key)
+        # Normalize for comparison
+        key = re.sub(r'[^a-z0-9 ]', '', s.lower()).strip()
+
+        # Check against existing unique steps
+        is_duplicate = False
+        for existing in unique:
+            existing_key = re.sub(r'[^a-z0-9 ]', '', existing.lower()).strip()
+
+            # Only consider duplicate if very high word overlap
+            words_new = set(key.split())
+            words_existing = set(existing_key.split())
+
+            if not words_new or not words_existing:
+                continue
+
+            # Calculate Jaccard similarity
+            intersection = words_new & words_existing
+            union = words_new | words_existing
+            similarity = len(intersection) / len(union) if union else 0
+
+            # Only mark as duplicate if >85% word overlap
+            if similarity > 0.85:
+                is_duplicate = True
+                break
+
+        if not is_duplicate and len(key) > 5:
             unique.append(s)
+
     return unique
 
 
@@ -519,24 +576,24 @@ def get_auth_step_description(auth_type: str, indicators: List[str] = None,
     app = app_name or "the application"
     descriptions = {
         "login": (
-            f"The system navigates to the login page of {app}. "
-            f"The automation enters the configured username/user ID and password. "
-            f"The 'Sign In' button is clicked to authenticate."
+            f"Navigate to the login page of {app}. "
+            f"Enter the configured username/user ID and password. "
+            f"Click the 'Sign In' button to authenticate."
         ),
         "logout": (
-            f"The system initiates the logout process from {app}. "
-            f"The automation clicks the logout option to end the session."
+            f"Initiate the logout process from {app}. "
+            f"Click the logout option to end the session."
         ),
         "mfa_verification": (
-            f"The system handles a multi-factor authentication prompt "
+            f"Handle a multi-factor authentication prompt "
             f"in {app} by completing the verification challenge."
         ),
         "password_change": (
-            f"The system navigates to the password management section of {app} "
-            f"and submits the password change."
+            f"Navigate to the password management section of {app} "
+            f"and submit the password change."
         ),
         "unknown_auth": (
-            f"The system interacts with an authentication screen in {app}."
+            f"Interact with an authentication screen in {app}."
         ),
     }
     return descriptions.get(auth_type, descriptions["unknown_auth"])
