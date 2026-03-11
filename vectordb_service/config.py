@@ -8,11 +8,11 @@ class Settings(BaseSettings):
     replicate_api_token: str = ""
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
-    pinecone_index_name: str = "framesdb"
-    pinecone_dimension: int = 1024
+    pinecone_index_name: str = "framesdb-v3"
+    pinecone_dimension: int = 768
     pinecone_cloud: str = "aws"
     pinecone_region: str = "us-east-1"
-    clip_model_id: str = "openai/clip-vit-base-patch32"
+    clip_model_id: str = "openai/clip-vit-large-patch14"
     data_dir: str = "./data"
     scene_threshold: float = 9.0
     omniparser_model: str = "microsoft/omniparser-v2:49cf3d41b8d3aca1360514e83be4c97131ce8f0d99abfc365526d8384caa88df"

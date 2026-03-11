@@ -17,10 +17,12 @@ class EmbeddingService:
 
     @staticmethod
     def _to_numpy(output) -> np.ndarray:
-        """Handle both raw tensors and BaseModelOutputWithPooling."""
+        """Handle both raw tensors and BaseModelOutputWithPooling, then L2-normalise."""
         if hasattr(output, "pooler_output"):
             output = output.pooler_output
-        return output.cpu().detach().numpy()
+        arr = output.cpu().detach().numpy()
+        norm = np.linalg.norm(arr, axis=-1, keepdims=True)
+        return arr / np.where(norm == 0, 1, norm)
 
     def get_image_embedding(self, image_path: str) -> np.ndarray:
         image = Image.open(image_path)

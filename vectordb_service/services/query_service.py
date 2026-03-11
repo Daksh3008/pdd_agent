@@ -3,8 +3,6 @@
 import logging
 import os
 
-import numpy as np
-
 from config import Settings
 from infrastructure.embedding_service import EmbeddingService
 from infrastructure.vector_store import VectorStore
@@ -24,17 +22,12 @@ class QueryService:
         self._vector_store = vector_store
 
     def query_frames(self, query_text: str, top_k: int = 5, video_id: str | None = None) -> dict:
-        # Text embedding (512-d for CLIP ViT-B/32)
+        # CLIP text embedding (512-d) — directly comparable to image embeddings
         text_emb = self._embedding.get_text_embedding(query_text)
-
-        # Place text embedding in both halves so it matches against
-        # both the image and text portions of stored vectors.
-        combined = np.concatenate(
-            [text_emb.flatten(), text_emb.flatten()]
-        ).tolist()
+        query_vector = text_emb.flatten().tolist()
 
         metadata_filter = {"video_id": {"$eq": video_id}} if video_id else None
-        results = self._vector_store.query(combined, top_k=top_k, filter=metadata_filter)
+        results = self._vector_store.query(query_vector, top_k=top_k, filter=metadata_filter)
 
         matches: list[dict] = []
         for m in results.get("matches", []):
