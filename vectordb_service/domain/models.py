@@ -39,6 +39,23 @@ class QueryResponse(BaseModel):
     results: list[FrameMatch]
 
 
+class LocateRequest(BaseModel):
+    query: str
+    top_k: int = 5
+    video_id: str | None = None
+
+
+class LocateResponse(BaseModel):
+    query: str
+    selected_frame: FrameMatch
+    selection_reason: str
+    omniparser_elements_count: int
+    located_element: str
+    bbox: list[float]
+    bbox_reason: str
+    annotated_image_url: str
+
+
 class UploadResponse(BaseModel):
     video_id: str
     scenes_detected: int
