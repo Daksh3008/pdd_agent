@@ -2,6 +2,8 @@
 
 from functools import lru_cache
 
+import replicate
+
 from config import Settings
 from infrastructure.embedding_service import EmbeddingService
 from infrastructure.vector_store import VectorStore
@@ -33,11 +35,17 @@ def get_vector_store() -> VectorStore:
     )
 
 
+@lru_cache
+def get_replicate_client() -> replicate.Client:
+    return replicate.Client(api_token=get_settings().replicate_api_token)
+
+
 def get_video_service() -> VideoService:
     return VideoService(
         settings=get_settings(),
         embedding_service=get_embedding_service(),
         vector_store=get_vector_store(),
+        replicate_client=get_replicate_client(),
     )
 
 

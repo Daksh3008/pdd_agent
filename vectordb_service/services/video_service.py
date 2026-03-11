@@ -2,10 +2,11 @@
 
 import logging
 import os
-import shutil
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
+import replicate
 
 from config import Settings
 from infrastructure.embedding_service import EmbeddingService
@@ -17,6 +18,8 @@ from infrastructure.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
 
+_OMNIPARSER_WORKERS = 5  # parallel Replicate calls
+
 
 class VideoService:
     def __init__(
@@ -24,10 +27,26 @@ class VideoService:
         settings: Settings,
         embedding_service: EmbeddingService,
         vector_store: VectorStore,
+        replicate_client: replicate.Client,
     ) -> None:
         self._settings = settings
         self._embedding = embedding_service
         self._vector_store = vector_store
+        self._replicate = replicate_client
+
+    # -- internal helpers -----------------------------------------------
+
+    def _run_omniparser(self, frame_info: dict) -> tuple[dict, dict]:
+        """Call OmniParser for a single frame (runs in a thread)."""
+        raw = parse_frame(
+            frame_info["filepath"],
+            self._settings.omniparser_model,
+            self._replicate,
+        )
+        processed = process_omniparser_output(frame_info["frame_no"], raw)
+        return frame_info, processed
+
+    # -- public ---------------------------------------------------------
 
     def process_video(self, video_bytes: bytes, original_filename: str) -> dict:
         video_id = uuid.uuid4().hex[:12]
@@ -49,24 +68,40 @@ class VideoService:
         frames = extract_scene_frames(video_path, scenes, frames_dir)
         logger.info("Frames extracted: %d", len(frames))
 
-        # 3. Process each frame: OmniParser → embeddings → upsert
+        # 3a. OmniParser — run in parallel threads (I/O-bound API calls)
+        omni_results: dict[str, dict] = {}  # filepath → processed output
+        with ThreadPoolExecutor(max_workers=_OMNIPARSER_WORKERS) as pool:
+            futures = {
+                pool.submit(self._run_omniparser, fi): fi for fi in frames
+            }
+            for future in as_completed(futures):
+                fi = futures[future]
+                try:
+                    _, processed = future.result()
+                    omni_results[fi["filepath"]] = processed
+                except Exception:
+                    logger.exception(
+                        "OmniParser failed for scene_%d_%s, skipping",
+                        fi["scene_id"], fi["label"],
+                    )
+
+        # 3b. Embeddings + vector assembly (CLIP is fast on CPU, keep sequential)
         vectors_to_upsert: list[tuple] = []
 
         for frame_info in frames:
             filepath = frame_info["filepath"]
-            scene_id = frame_info["scene_id"]
-            label = frame_info["label"]
-            frame_no = frame_info["frame_no"]
+            processed = omni_results.get(filepath)
+            if processed is None:
+                continue
 
             try:
-                # OmniParser
-                raw_omni = parse_frame(filepath, self._settings.omniparser_model, self._settings.replicate_api_token)
-                processed = process_omniparser_output(frame_no, raw_omni)
-
-                # Embeddings
                 image_emb = self._embedding.get_image_embedding(filepath)
                 summary = processed["summary"]
-                text_for_emb = " ".join(summary["visible_text"]) + " " + " ".join(summary["possible_actions"])
+                text_for_emb = (
+                    " ".join(summary["visible_text"])
+                    + " "
+                    + " ".join(summary["possible_actions"])
+                )
                 text_emb = self._embedding.get_text_embedding(text_for_emb)
 
                 combined = np.concatenate(
@@ -75,20 +110,21 @@ class VideoService:
 
                 metadata = {
                     "video_id": video_id,
-                    "frame_no": frame_no,
-                    "scene_id": scene_id,
-                    "label": label,
+                    "frame_no": frame_info["frame_no"],
+                    "scene_id": frame_info["scene_id"],
+                    "label": frame_info["label"],
                     "filename": frame_info["filename"],
                     "omniparser_summary_text": " ".join(summary["visible_text"]),
                     "omniparser_summary_actions": " ".join(summary["possible_actions"]),
                     "compact_elements": processed["compact_elements"],
                 }
 
-                vector_id = f"{video_id}_scene_{scene_id}_{label}"
+                vector_id = f"{video_id}_scene_{frame_info['scene_id']}_{frame_info['label']}"
                 vectors_to_upsert.append((vector_id, combined, metadata))
             except Exception:
                 logger.exception(
-                    "Failed to process frame scene_%d_%s, skipping", scene_id, label
+                    "Embedding failed for scene_%d_%s, skipping",
+                    frame_info["scene_id"], frame_info["label"],
                 )
 
         # 4. Upsert to Pinecone
