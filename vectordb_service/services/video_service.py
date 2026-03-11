@@ -1,24 +1,19 @@
-"""Orchestrates the full video-processing pipeline: scenes → frames → OmniParser → embeddings → Pinecone."""
+"""Orchestrates the full video-processing pipeline: scenes → frames → Gemini → embeddings → Pinecone."""
 
 import logging
 import os
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
-import replicate
 
 from config import Settings
 from infrastructure.embedding_service import EmbeddingService
 from infrastructure.frame_extractor import extract_scene_frames
-from infrastructure.omniparser_client import parse_frame
-from infrastructure.omniparser_processor import process_omniparser_output
+from infrastructure.gemini_describer import describe_frames
 from infrastructure.scene_detector import detect_scenes
 from infrastructure.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
-
-_OMNIPARSER_WORKERS = 5  # parallel Replicate calls
 
 
 class VideoService:
@@ -27,24 +22,10 @@ class VideoService:
         settings: Settings,
         embedding_service: EmbeddingService,
         vector_store: VectorStore,
-        replicate_client: replicate.Client,
     ) -> None:
         self._settings = settings
         self._embedding = embedding_service
         self._vector_store = vector_store
-        self._replicate = replicate_client
-
-    # -- internal helpers -----------------------------------------------
-
-    def _run_omniparser(self, frame_info: dict) -> tuple[dict, dict]:
-        """Call OmniParser for a single frame (runs in a thread)."""
-        raw = parse_frame(
-            frame_info["filepath"],
-            self._settings.omniparser_model,
-            self._replicate,
-        )
-        processed = process_omniparser_output(frame_info["frame_no"], raw)
-        return frame_info, processed
 
     # -- public ---------------------------------------------------------
 
@@ -68,41 +49,31 @@ class VideoService:
         frames = extract_scene_frames(video_path, scenes, frames_dir)
         logger.info("Frames extracted: %d", len(frames))
 
-        # 3a. OmniParser — run in parallel threads (I/O-bound API calls)
-        omni_results: dict[str, dict] = {}  # filepath → processed output
-        with ThreadPoolExecutor(max_workers=_OMNIPARSER_WORKERS) as pool:
-            futures = {
-                pool.submit(self._run_omniparser, fi): fi for fi in frames
-            }
-            for future in as_completed(futures):
-                fi = futures[future]
-                try:
-                    _, processed = future.result()
-                    omni_results[fi["filepath"]] = processed
-                except Exception:
-                    logger.exception(
-                        "OmniParser failed for scene_%d_%s, skipping",
-                        fi["scene_id"], fi["label"],
-                    )
+        # 3a. Gemini batch description — send all frames in video order
+        sorted_frames = sorted(frames, key=lambda f: (f["scene_id"], f["frame_no"]))
+        try:
+            gemini_results = describe_frames(
+                api_key=self._settings.gemini_api_key,
+                frame_infos=sorted_frames,
+                model=self._settings.gemini_model,
+            )
+        except Exception:
+            logger.exception("Gemini batch description failed")
+            gemini_results = {}
 
         # 3b. Embeddings + vector assembly (CLIP is fast on CPU, keep sequential)
         vectors_to_upsert: list[tuple] = []
 
         for frame_info in frames:
             filepath = frame_info["filepath"]
-            processed = omni_results.get(filepath)
+            processed = gemini_results.get(filepath)
             if processed is None:
                 continue
 
             try:
                 image_emb = self._embedding.get_image_embedding(filepath)
-                summary = processed["summary"]
-                text_for_emb = (
-                    " ".join(summary["visible_text"])
-                    + " "
-                    + " ".join(summary["possible_actions"])
-                )
-                text_emb = self._embedding.get_text_embedding(text_for_emb)
+                search_text = processed.get("search_keywords", "")
+                text_emb = self._embedding.get_text_embedding(search_text)
 
                 combined = np.concatenate(
                     [image_emb.flatten(), text_emb.flatten()]
@@ -110,13 +81,11 @@ class VideoService:
 
                 metadata = {
                     "video_id": video_id,
-                    "frame_no": frame_info["frame_no"],
-                    "scene_id": frame_info["scene_id"],
-                    "label": frame_info["label"],
                     "filename": frame_info["filename"],
-                    "omniparser_summary_text": " ".join(summary["visible_text"]),
-                    "omniparser_summary_actions": " ".join(summary["possible_actions"]),
-                    "compact_elements": processed["compact_elements"],
+                    "scene_id": frame_info["scene_id"],
+                    "step_number": processed.get("step_number", 0),
+                    "step_title": processed.get("step_title", ""),
+                    "description": processed.get("description", ""),
                 }
 
                 vector_id = f"{video_id}_scene_{frame_info['scene_id']}_{frame_info['label']}"

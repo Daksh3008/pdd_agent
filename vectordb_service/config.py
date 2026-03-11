@@ -6,6 +6,8 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     pinecone_api_key: str = ""
     replicate_api_token: str = ""
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.5-flash"
     pinecone_index_name: str = "framesdb"
     pinecone_dimension: int = 1024
     pinecone_cloud: str = "aws"

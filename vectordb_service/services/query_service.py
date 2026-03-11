@@ -26,12 +26,11 @@ class QueryService:
     def query_frames(self, query_text: str, top_k: int = 5, video_id: str | None = None) -> dict:
         # Text embedding (512-d for CLIP ViT-B/32)
         text_emb = self._embedding.get_text_embedding(query_text)
-        emb_dim = text_emb.shape[-1]
 
-        # Pad image portion with zeros so combined vector is 1024-d
-        zero_image = np.zeros((1, emb_dim))
+        # Place text embedding in both halves so it matches against
+        # both the image and text portions of stored vectors.
         combined = np.concatenate(
-            [zero_image.flatten(), text_emb.flatten()]
+            [text_emb.flatten(), text_emb.flatten()]
         ).tolist()
 
         metadata_filter = {"video_id": {"$eq": video_id}} if video_id else None

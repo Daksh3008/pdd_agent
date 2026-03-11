@@ -16,6 +16,7 @@ dependencies = [
     "torch>=2.5.0",
     "transformers>=4.47.0",
     "replicate>=1.0.0",
+    "google-genai>=1.0.0",
     "Pillow>=11.0.0",
     "pydantic>=2.12.5",
 ]
