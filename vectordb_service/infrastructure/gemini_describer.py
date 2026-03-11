@@ -33,7 +33,7 @@ _SYSTEM_PROMPT = (
     '        {\n'
     '          "frame_index": <0-based index matching input order>,\n'
     '          "description": "<detailed description of what is shown and what the user is doing in this frame, in the context of this step and the overall workflow>",\n'
-    '          "search_keywords": "<a concise single sentence of 10-15 words capturing the key action and UI elements visible, optimized for search retrieval e.g. open Excel spreadsheet with phone number data columns>"\n'
+    '          "search_keywords": "<10-15 words focusing on: 1) the APPLICATION or WEBSITE name shown (e.g. Excel, Chrome, Canada411), 2) the specific USER ACTION being performed (e.g. typing, clicking, selecting, copying, pasting, opening, scrolling), 3) the key PAGE or SCREEN visible (e.g. login page, search results, spreadsheet, settings panel). Example: user typing phone number in Canada411 reverse lookup search field>"\n'
     '        }\n'
     '      ]\n'
     '    }\n'
