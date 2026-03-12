@@ -2,6 +2,7 @@ import logging
 import os
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from api.routes import query, video
@@ -16,6 +17,14 @@ app = FastAPI(
     title="VectorDB Frame Service",
     description="Upload videos, extract & index frames, and query them by text.",
     version="0.1.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Serve extracted frame images as static files

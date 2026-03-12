@@ -1,4 +1,5 @@
 import os
+from typing import List
 
 from pydantic_settings import BaseSettings
 
@@ -16,6 +17,7 @@ class Settings(BaseSettings):
     data_dir: str = "./data"
     scene_threshold: float = 9.0
     omniparser_model: str = "microsoft/omniparser-v2:49cf3d41b8d3aca1360514e83be4c97131ce8f0d99abfc365526d8384caa88df"
+    cors_origins: List[str] = ["*"]
 
     model_config = {"env_file": ".env"}
 
