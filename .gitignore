@@ -52,6 +52,7 @@ data/models/*
 !data/output/.gitkeep
 !data/intermediate/.gitkeep
 !data/models/.gitkeep
+vectordb_service/data/*
 
 # Model cache
 *.bin
