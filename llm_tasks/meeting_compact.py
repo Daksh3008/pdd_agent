@@ -1240,36 +1240,50 @@ JSON STRUCTURE REQUIRED:
   "project_name": "Short name",
   "entities": {{"companies": [], "applications": [], "systems": [], "departments": []}},
   "document": {{
-    "purpose": "2-3 paragraphs",
-    "overview": "1 paragraph + bullet points",
-    "justification": "1 paragraph + numbered benefits",
-    "as_is": "3-4 paragraphs ending with Business Challenges list",
-    "to_be": "3-4 paragraphs"
+    "purpose": "Comprehensive 3-4 paragraph explanation of WHY this process automation is needed, including current pain points and business drivers.",
+    "overview": "Detailed 2-3 paragraph description of WHAT the automation does, WHO is involved, and WHICH systems are used. Include specific system names, user roles, and data flows.",
+    "justification": "Detailed breakdown of expected benefits with specific numbers where possible. Include time savings, error reduction, and compliance improvements.",
+    "as_is": "Highly detailed step-by-step walkthrough of the CURRENT manual process. For each step, describe WHO does WHAT, WHICH screen/field is used, and WHAT data is handled. End with a numbered list of business challenges.",
+    "to_be": "Highly detailed step-by-step description of the AUTOMATED process. For each step, specify WHICH button to click, WHICH menu to navigate, WHICH data fields are used, and HOW the automation handles exceptions."
   }},
   "process": {{
     "process_steps": [
-      "High-level logical step 1",
-      "High-level logical step 2"
+      "Detailed actionable step 1: Describe exactly what action is taken (e.g., 'Login to Autodesk Portal using SSO credentials')",
+      "Detailed actionable step 2: Describe exactly what action is taken (e.g., 'Navigate to User Management -> By User, select team from dropdown')"
     ],
     "detailed_steps": [
       {{
-        "action": "Granular screen-level action 1 (e.g. Go to X -> Click Y)",
+        "action": "Granular screen-level action with EXACT button names and navigation paths. Format with newlines for complex actions.",
         "ui_target": "Exact UI element for querying (e.g. 'Export button' or 'Al Futtaim dropdown')"
       }}
     ]
   }},
   "requirements": {{
     "input_requirements": [
-      {{"parameter": "Param", "description": "Desc"}}
+      {{"parameter": "Param", "description": "Detailed description of what this input is, where it comes from, and format expected."}},
+      {{"parameter": "Application URL", "description": "Web address of the target application (e.g., https://autodesk.example.com)."}},
+      {{"parameter": "User Credentials", "description": "SSO credentials with appropriate permissions to access user management functions."}}
     ],
     "interface_requirements": [
-      {{"application": "App", "purpose": "Desc"}}
+      {{"application": "App Name", "purpose": "Detailed description of how this application is used in the process."}}
     ],
     "exception_handling": [
-      {{"exception": "Error", "handling": "Action"}}
+      {{"exception": "Error Scenario", "handling": "Detailed step-by-step handling action."}}
     ]
   }}
 }}
+
+CRITICAL RULES FOR DOCUMENT SECTIONS:
+1. PURPOSE: Write as a compelling business case. Explain WHY this automation is critical. Reference specific pain points from the transcript/screenshots.
+2. OVERVIEW: Be specific about systems, users, and data. Don't say "the system" - say EXACTLY which application, screen, or module.
+3. AS-IS: Write a chronological walkthrough of the MANUAL process. Each sentence should tell the reader exactly what happens. Include specific UI elements, data values, and decisions.
+4. TO-BE: Write from the automation's perspective. Every sentence should describe what the bot clicks, navigates to, or data it processes. Be specific about button names, menu paths, checkbox states.
+
+CRITICAL RULES FOR process_steps (High-Level Logic):
+- These are the main automation actions - write them as actionable instructions someone could follow
+- Start each with an action verb (e.g., "Log in to...", "Navigate to...", "Export...")
+- Include specific application names, menu paths, and data elements
+- DO NOT summarize - be specific about what happens at each major phase
 
 CRITICAL RULES FOR detailed_steps (Screen-level Actions):
 1. ABSOLUTELY NO NARRATIVE FLUFF. Do NOT write "in the primary navigation menu".
@@ -1280,11 +1294,6 @@ CRITICAL RULES FOR detailed_steps (Screen-level Actions):
 5. CONDITIONALS: If a conditional pop-up occurs, state it clearly: "If a Warning popup appears -> Select 'Continue', Then click 'Remove'."
 6. Every step MUST start with an action verb (e.g., Log in, Navigate, Click, Select, Go to). Do NOT start with "The system...".
 7. The `ui_target` field MUST be a hyper-focused, 3-5 word description of the PRIMARY button or element being interacted with in this step (e.g., "Export button", "User Management tab", "Categories Users checkbox"). This field is used for visual bounding-box search.
-
-CRITICAL RULES FOR process_steps (High-Level Logic):
-- Identify loops, branches, and conditional decisions based on the screenshots and transcript.
-- Start each step with an action verb.
-- Do NOT include every click. Group them logically.
 
 TRANSCRIPT:
 {sample}
